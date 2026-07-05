@@ -223,6 +223,68 @@ A：检查 `codebook.xlsx` 是否格式正确，确保 `dept_id` 和 `level` 组
 **Q：我可以完全离线运行吗？**  
 A：可以。所有依赖库均为本地包，无需联网。
 
+好的，我只保留 **Q1** 和 **Q2** 这两个问题，整理成简洁的 Q&A 格式，方便您直接放入 GitHub README。
+
 ---
 
-**现在，您已掌握所有必要信息。开始清洗您的数据吧！** 🎉
+## ❓ 常见问题（FAQ）
+
+### Q：运行 `python3 gui.py` 时报错 `ModuleNotFoundError: No module named '_tkinter'`，怎么办？
+
+**A：** 这是 macOS 上通过 Homebrew 安装的 Python 默认**不带 Tkinter（图形界面库）** 导致的。请按以下方案解决：
+
+**方案一（推荐）：安装 `python-tk`**
+```bash
+brew install python-tk
+```
+安装完成后，重新运行 `python3 gui.py` 即可。
+
+**方案二：使用 Python 官网安装包**
+1. 访问 [python.org/downloads](https://www.python.org/downloads/)
+2. 下载 macOS 安装包（`.pkg` 文件），**安装时确保勾选 "Install Tcl/Tk"**
+3. 安装后使用 `/Library/Frameworks/Python.framework/Versions/3.x/bin/python3` 运行
+
+**方案三：使用 `pyenv` 安装带 Tk 的 Python**
+```bash
+brew install pyenv tcl-tk
+export LDFLAGS="-L/usr/local/opt/tcl-tk/lib"
+export CPPFLAGS="-I/usr/local/opt/tcl-tk/include"
+pyenv install 3.13.3
+pyenv global 3.13.3
+```
+
+---
+
+### Q2：安装 `python-tk` 时 Homebrew 报错 `undefined method '[]' for nil`，怎么解决？
+
+**A：** 这通常是 Homebrew 本地缓存损坏或版本不一致导致的。请按以下步骤修复：
+
+**步骤 1：更新并清理 Homebrew**
+```bash
+brew update
+brew cleanup --prune=all
+brew doctor   # 检查是否有其他环境问题
+```
+
+**步骤 2：单独安装依赖项**
+```bash
+# 先单独安装报错的依赖
+brew install ca-certificates
+
+# 再安装 Tcl/Tk 图形库
+brew install tcl-tk
+
+# 最后重新尝试安装 python-tk
+brew install python-tk
+```
+
+**步骤 3（备用）：重置 Homebrew 核心仓库**
+```bash
+cd $(brew --repo homebrew/core)
+git fetch origin
+git reset --hard origin/master
+brew update
+```
+
+**如果以上均无效**，建议直接使用 Q1 中的**方案二（Python 官网安装包）**，完全绕过 Homebrew 的问题。
+
