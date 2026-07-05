@@ -69,7 +69,7 @@
 确保 Python 版本 ≥ 3.7，安装依赖：
 
 ```bash
-pip install -r requirements.txt
+pip3 install --user --break-system-packages -r requirements.txt
 ```
 
 `requirements.txt` 内容：
