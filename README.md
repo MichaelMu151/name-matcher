@@ -225,13 +225,9 @@ A：可以。所有依赖库均为本地包，无需联网。
 
 好的，我只保留 **Q1** 和 **Q2** 这两个问题，整理成简洁的 Q&A 格式，方便您直接放入 GitHub README。
 
----
+**Q：运行 `python3 gui.py` 时报错 `ModuleNotFoundError: No module named '_tkinter'`，怎么办？**
 
-## ❓ 常见问题（FAQ）
-
-### Q：运行 `python3 gui.py` 时报错 `ModuleNotFoundError: No module named '_tkinter'`，怎么办？
-
-**A：** 这是 macOS 上通过 Homebrew 安装的 Python 默认**不带 Tkinter（图形界面库）** 导致的。请按以下方案解决：
+A：这是 macOS 上通过 Homebrew 安装的 Python 默认**不带 Tkinter（图形界面库）** 导致的。请按以下方案解决：
 
 **方案一（推荐）：安装 `python-tk`**
 ```bash
@@ -253,11 +249,9 @@ pyenv install 3.13.3
 pyenv global 3.13.3
 ```
 
----
+**Q：安装 `python-tk` 时 Homebrew 报错 `undefined method '[]' for nil`，怎么解决？**
 
-### Q2：安装 `python-tk` 时 Homebrew 报错 `undefined method '[]' for nil`，怎么解决？
-
-**A：** 这通常是 Homebrew 本地缓存损坏或版本不一致导致的。请按以下步骤修复：
+A：这通常是 Homebrew 本地缓存损坏或版本不一致导致的。请按以下步骤修复：
 
 **步骤 1：更新并清理 Homebrew**
 ```bash
