@@ -62,14 +62,15 @@ LEVEL_MAP = {
     "省": "省级",
     "地级市": "市级", "市": "市级",
     "县": "县级", "区": "县级", "县级市": "县级",
-    "经济区": "县级", "功能区": "县级",
+    "经济区": "县级", "旅游区": "县级", "功能区": "县级",
 }
 
+# 匹配过程中使用到的特征变量
 FEATURE_NAMES = ["ratio", "partial_ratio", "token_sort_ratio",
                  "jaro_winkler", "dice", "lcs_ratio", "tfidf_cos",
                  "len_ratio", "exact"]
 
-# 冷启动（未训练模型时）的启发式加权融合系数
+# 冷启动（未训练模型时）的启发式加权融合系数，可自行调整
 HEURISTIC_WEIGHTS = {
     "ratio": 0.22, "partial_ratio": 0.10, "token_sort_ratio": 0.10,
     "jaro_winkler": 0.10, "dice": 0.18, "lcs_ratio": 0.10,
@@ -111,19 +112,20 @@ _PUNCT_RE = re.compile(r"[\s\u3000（）()【】\[\]:：·,，、\.。;；\"'“
 
 
 def normalize_text(s) -> str:
-    """全角/半角统一 + 去除常见标点空白，避免无意义差异干扰相似度计算"""
+    """清洗文本：全半角统一(NFKC) + 剔除空格/标点/括号等无意义干扰符号"""
     if pd.isna(s):
         return ""
-    s = unicodedata.normalize("NFKC", str(s))
-    return _PUNCT_RE.sub("", s).strip()
+    s = unicodedata.normalize("NFKC", str(s)) # Normalization Form KC（兼容性分解（K）后按规范组合（C））
+    return _PUNCT_RE.sub("", s).strip() # 去除空格和标点
 
 
 def map_level(dtype_t: str) -> str:
+    """将用户输入的杂乱层级描述(如'地级市'/'区')，强制归一化为系统内部的'省级/市级/县级'三档标准值"""
     key = str(dtype_t).strip()
     lvl = LEVEL_MAP.get(key)
     if lvl is None:
         raise MatcherError(
-            f"未知的 dtype_t: '{dtype_t}'，应为 省/地级市/县/区/县级市/经济区/功能区 之一"
+            f"未知的 dtype_t: '{dtype_t}'，应为 省/地级市/县/区/县级市/经济区/功能区/旅游区 之一"
         )
     return lvl
 
@@ -137,6 +139,7 @@ def confidence_tier(score: float) -> str:
 
 
 def _lcs_length(a: str, b: str) -> int:
+    """动态规划求最长公共子序列长度：允许跳字，专门捕捉'发改委'→'发展和改革委员会'的核心骨架提取"""
     n, m = len(a), len(b)
     if n == 0 or m == 0:
         return 0
@@ -150,14 +153,15 @@ def _lcs_length(a: str, b: str) -> int:
     return prev[m]
 
 
-def lcs_ratio(a: str, b: str) -> float:
-    """最长公共子序列比例：专门捕捉'发展和改革委员会→发改委'这类逐字提取式缩写"""
+def lcs_ratio(a: str, b: str) -> float: # 使用ratio是为了能够更好的区分公共子序列得分，因为部门名字越长，“委员会”、“局”这样的大概率重复出现却无法提供区分信息的子序列也会增加，计算ratio能够更大程度的保留具有区分度的信息
+    """最长公共子序列比例：专门捕捉'发展和改革委员会→发改委'这类逐字提取式缩写; 归一化LCS长度，算出简称保留了全称的百分之多少的'关键字符骨架'"""
     if not a or not b:
         return 0.0
     return _lcs_length(a, b) / max(len(a), len(b))
 
 
-def char_dice(a: str, b: str) -> float:
+def char_dice(a: str, b: str) -> float: 
+    """字符2-gram Dice系数：计算两个名字共享的相邻二字组合比例，专门捕获'发改'、'财政'等固定词组"""
     def bigrams(s):
         return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 1 else {s}
     A, B = bigrams(a), bigrams(b)
@@ -167,6 +171,7 @@ def char_dice(a: str, b: str) -> float:
 
 
 def extract_features(raw_n: str, cand_n: str, tfidf_cos: float) -> np.ndarray:
+    """装配9维特征向量（编辑距离/LCS/Dice/Jaro/TF-IDF等），这是喂给逻辑回归模型的'数值坐标'"""
     exact = 1.0 if (raw_n == cand_n and raw_n != "") else 0.0
     feats = {
         "ratio": fuzz.ratio(raw_n, cand_n) / 100.0,
@@ -183,6 +188,7 @@ def extract_features(raw_n: str, cand_n: str, tfidf_cos: float) -> np.ndarray:
 
 
 def heuristic_score(feat_vec: np.ndarray) -> float:
+    """冷启动后备方案(baseline parameters)：使用人工预定义的静态权重对9维特征做加权求和，确保无训练数据时系统仍可用"""
     d = dict(zip(FEATURE_NAMES, feat_vec))
     if d["exact"] == 1.0:
         return 1.0
@@ -220,6 +226,7 @@ class CodeBook:
             logger.warning(f"codebook 中存在 {dup.sum()} 行 (dept_id, level) 重复，建议核查")
 
     def _build_index(self):
+        """将标准名+别名展开成变体列表，并构建字符级TF-IDF向量矩阵，用于快速相似度粗筛"""
         self.df["norm_name"] = self.df["standard_name"].apply(normalize_text)
         rows = []
         for _, r in self.df.iterrows():
@@ -237,6 +244,7 @@ class CodeBook:
 
     # ---------- 修改操作 ----------
     def add_alias(self, dept_id: str, level: str, raw_name_norm: str) -> bool:
+        """用户确认后，将新的原始写法写入别名库，使其下次直接精确命中（零成本记忆）"""
         mask = (self.df["dept_id"] == dept_id) & (self.df["level"] == level)
         if not mask.any():
             logger.error(f"add_alias 失败: 找不到 dept_id={dept_id}, level={level}")
@@ -262,6 +270,7 @@ class CodeBook:
         logger.info(f"新增部门: dept_id={dept_id}, level={level}, standard_name={standard_name}")
 
     def save(self):
+        """原子化保存Codebook：先写临时文件再重命名替换，防止中途崩溃导致源文件损坏"""
         if os.path.exists(self.path):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = os.path.join(self.backup_dir, f"codebook_backup_{ts}.xlsx")
@@ -373,6 +382,7 @@ class DeptMatcher:
         return best[["dept_id", "standard_name", "score"]].reset_index(drop=True)
 
     def query(self, raw_name: str, dtype_t: str, topk: int = 3, use_cache: bool = True) -> pd.DataFrame:
+        """单条查询：全量遍历候选，提取9维特征后精确打分，返回Top-K候选（最稳定，毫秒级）"""
         level = map_level(dtype_t)
         raw_n = normalize_text(raw_name)
         if not raw_n:
@@ -398,7 +408,7 @@ class DeptMatcher:
     # ---------------- 批量查询：两阶段"检索+精排" ----------------
     def _stage1_candidates(self, raw_list: List[str], level: str, topn: int
                             ) -> Dict[str, List[Tuple[str, str, float]]]:
-        """TF-IDF向量化快速粗筛，返回 {raw_norm: [(dept_id, variant, tfidf_cos), ...]}"""
+        """批量模式第一阶段：TF-IDF矩阵乘法快速粗筛，从海量候选中仅保留Top-K个最相关部门，返回 {raw_norm: [(dept_id, variant, tfidf_cos), ...]}""" 
         exp = self.codebook.expanded
         mask = (exp["level"] == level).values
         if not mask.any():
@@ -432,6 +442,7 @@ class DeptMatcher:
         return row.iloc[0]["standard_name"] if len(row) else fallback
 
     def _rerank(self, raw_n: str, candidates: List[Tuple[str, str, float]]) -> List[MatchResult]:
+        """批量模式第二阶段：对粗筛保留的极少数候选执行9维精细特征计算+模型打分，实现高精度重排"""
         if not candidates:
             return []
         rows = []
@@ -445,6 +456,7 @@ class DeptMatcher:
     def batch_query(self, df: pd.DataFrame, topk: int = 3,
                      col_name: str = "w_name_o", col_level: str = "dtype_t",
                      progress_callback=None) -> pd.DataFrame:
+        """批量处理入口：两阶段检索+精排，支持进度回调，万级数据毫秒级完成"""
         if col_name not in df.columns or col_level not in df.columns:
             raise MatcherError(f"输入数据必须包含列: {col_name}, {col_level}")
 
@@ -501,6 +513,7 @@ class DeptMatcher:
     # ---------------- 人工反馈：确认 / 标记无匹配 ----------------
     def confirm(self, raw_name: str, dtype_t: str, dept_id: str,
                 log_path: str = "confirmed_log.xlsx"):
+        """人工确认闭环：将正确映射写入别名库（立竿见影）+ 写入训练日志（为下次重训积累数据）"""
         level = map_level(dtype_t)
         raw_n = normalize_text(raw_name)
         if self.codebook.add_alias(dept_id, level, raw_n):
@@ -513,6 +526,7 @@ class DeptMatcher:
 
     def flag_unmatched(self, raw_name: str, dtype_t: str, note: str = "",
                         log_path: str = "unmatched_log.xlsx"):
+        """记录用户明确判定"无任何候选匹配"的原始名称。这些数据将作为后续新增部门或扩大别名库的待审线索"""
         log_row = pd.DataFrame([{"w_name_o": raw_name, "dtype_t": dtype_t,
                                   "note": note, "flagged_at": datetime.now().isoformat()}])
         self._append_log(log_row, log_path)
@@ -520,6 +534,7 @@ class DeptMatcher:
 
     @staticmethod
     def _append_log(new_rows: pd.DataFrame, log_path: str):
+        """原子化追加Excel日志：先读旧表→合并→写临时文件→再重命名替换，防止写入中途崩溃损坏原始日志文件"""
         if os.path.exists(log_path):
             combined = pd.concat([pd.read_excel(log_path), new_rows], ignore_index=True)
         else:
@@ -530,6 +545,7 @@ class DeptMatcher:
 
     # ---------------- 模型训练与评估 ----------------
     def _raw_features_for_training(self, raw_n: str, level: str) -> Dict[str, Tuple[np.ndarray, float]]:
+        """预处理训练特征：对给定原始名称，计算该层级下所有变体的9维特征+启发式分数，**每个dept_id仅保留分数最高的那个变体**，返回给train()作为正/负样本的原材料"""
         exp = self.codebook.expanded
         mask = (exp["level"] == level).values
         if not mask.any():
@@ -550,6 +566,7 @@ class DeptMatcher:
     def train(self, training_data_path: str, model_out: str,
               model_type: str = "logistic", test_size: float = 0.2,
               hard_negatives: int = 6, random_state: int = 42) -> dict:
+        """难负例挖掘训练：从历史确认数据中筛选'极易混淆的错误候选'作为负样本，训练逻辑回归/随机森林重排序模型，返回Top1/Top3准确率"""
         df = pd.read_excel(training_data_path, dtype=str).fillna("")
         required = {"w_name_o", "dtype_t", "dept_id"}
         if not required.issubset(df.columns):
