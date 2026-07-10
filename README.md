@@ -62,6 +62,7 @@
 ```
 .
 ├── matcher.py               # 核心匹配引擎（CodeBook 管理、相似度计算、模型训练）
+├── convert_to_matcher_format.py   # 一个专属于我的调整兼容性的程序，负责把我的数据库的格式转变为matcher所需要的格式
 ├── gui.py                   # Tkinter 图形界面（4 个页签）
 ├── requirements.txt         # Python 依赖清单
 ├── codebook.xlsx            # 【必填】标准部门编码池（初始需手动准备）
