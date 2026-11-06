@@ -35,7 +35,10 @@ def _candidate_options(value: Any) -> list[str]:
 def _apply_human_choices(source_path: Path, system_path: Path, log_path: Path, codebook: Any, choices: dict[str, tuple[str, str]], target_fields: tuple[str, ...], field_mapping: dict[str, str], session_id: str, operator: str, debug_records: pd.DataFrame | None = None) -> tuple[Path, Path]:
     """Apply only entity-id selections and return revised content/log files."""
 
-    from .pipeline import Pipeline, _clean
+    try:
+        from .pipeline import Pipeline, _clean
+    except ImportError:  # Streamlit executes this file as a script.
+        from src.engine.pipeline import Pipeline, _clean
 
     source = pd.read_excel(source_path, dtype=object) if source_path.suffix.lower() == ".xlsx" else pd.read_csv(source_path, dtype=object)
     reviewed = pd.read_excel(system_path, dtype=object)
@@ -96,8 +99,14 @@ def run_app() -> None:
         import streamlit as st
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("review-ui 需要安装 streamlit") from exc
-    from .codebook import Codebook
-    from .pipeline import Pipeline
+    try:
+        from .codebook import Codebook
+        from .pipeline import Pipeline
+    except ImportError:  # Streamlit executes this file as a script.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from src.engine.codebook import Codebook
+        from src.engine.pipeline import Pipeline
 
     st.set_page_config(page_title="Department matcher review", layout="wide")
     st.title("政府部门名称编码复核")
@@ -153,3 +162,7 @@ def run_app() -> None:
         reviewed, log = st.session_state["human_exports"]
         st.download_button("下载 reviewed_content.xlsx", Path(reviewed).read_bytes(), file_name="reviewed_content.xlsx")
         st.download_button("下载 modification_log.xlsx", Path(log).read_bytes(), file_name="modification_log.xlsx")
+
+
+if __name__ == "__main__":
+    run_app()
