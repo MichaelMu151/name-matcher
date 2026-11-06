@@ -4,3 +4,11 @@ openpyxl
 rapidfuzz
 scikit-learn
 joblib
+pydantic
+pyyaml
+pyarrow
+lightgbm
+jieba
+typer
+pytest
+streamlit

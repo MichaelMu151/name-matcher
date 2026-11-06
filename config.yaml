@@ -1,0 +1,47 @@
+audited_fields:
+  - w_name
+  - wrank_t
+  - s1_sector
+
+field_mapping:
+  w_name: w_name
+  wrank_t: wrank
+  s1_sector: s1_sector
+
+ui:
+  allow_human_override_target_columns: false
+  export_files:
+    content: reviewed_content.xlsx
+    log: modification_log.xlsx
+
+matching:
+  candidate_k: 10
+  month_tolerance: 0
+  year_tolerance: 0
+  dedupe_include_distname: true
+  distname_hard_filter: false
+
+policy:
+  tau_auto: 0.85
+  margin_auto: 0.10
+  tau_nil: 0.15
+  alpha: 0.02
+
+input_mapping:
+  record_id: record_id
+  year: year
+  dtype: dtype
+  dtype_fallback: dtype_t
+  context_fields:
+    - p_name
+    - post1
+    - context
+
+models:
+  default_version: synthetic_ranker
+  llm_model: fake
+  llm_budget: 100
+
+paths:
+  reports_dir: reports
+  resource_dir: resources

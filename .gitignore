@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+
+# Local/editor files
+.DS_Store
+.Rhistory
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.log
+
+# Research data and generated artifacts
+*.xlsx
+*.xls
+*.xlsm
+outputs/
+data/
+reports/*
+!reports/.gitkeep
+reports/llm_cache.jsonl
+models/*.joblib
+models/*.pkl
+*.bak
+

@@ -1,299 +1,263 @@
-# name-matcher
-# 广东省行政部门名称标准化匹配系统
+# 政府部门名称编码器
 
----
+这是一个面向政府组织史数据的部门名称匹配与审核引擎。它把输入数据中的脏部门名称 w_name_o 与结构化部门 codebook 进行匹配，并在满足安全条件时，从 codebook 回填三个正式字段：
 
-## 项目简介
+- w_name：codebook 中的正式部门名称；
+- wrank_t：部门级别，值来自 codebook 的 wrank；
+- s1_sector：部门类别，值来自 codebook 的 s1_sector。
 
-在处理政府公文、统计报表、历史档案时，经常遇到同一个行政部门在不同文件中写法各异的情况（如“广东省发展和改革委员会” vs “省发改委” vs “广东发改局”）。人工标准化费时费力，且难以保证一致性。
+核心原则是：模型只能提供匹配证据，不能生成正式字段；正式字段必须通过唯一 entity_id 回查 codebook 得到。无法安全判断时，程序转为人工复核，而不是强行编码。
 
-**本系统** 提供了一个**开箱即用、可交互、可自学习**的智能匹配工具，能够：
+## 主要能力
 
-- 自动将任意写法的部门名称映射到标准名称，并给出唯一的 `dept_id`
-- 支持**单条查询**和**批量清洗**
-- 内置**启发式算法**（冷启动）与**可训练的机器学习重排序模型**，随着人工反馈不断优化准确率
-- 提供**图形界面（GUI）**，无需编写代码即可完成日常清洗工作
-- 所有操作都有**日志记录**和**自动备份**，安全可靠
+1. 读取并审计 Excel/CSV codebook。
+2. 进行 NFKC、括号内容、地名前缀、标点、后缀和修饰词处理。
+3. 通过精确、别名、核心词、RapidFuzz 和字符 TF-IDF 召回候选。
+4. 检查任职时间段与 codebook 有效时间段的交集。
+5. 检测共享别名、别名/正式名称冲突、多实体、城市缺失、地区不一致和非法时间。
+6. 使用 LightGBM LambdaRank 加分类器排序；没有 LightGBM 时退回标准化逻辑回归。
+7. 进行概率校准，并按保守政策分流为 AUTO、HUMAN、MULTIPLE 或 NONE。
+8. 对 LLM 仲裁提供候选白名单、Pydantic JSON 校验、候选顺序双调用和预算控制。默认使用不联网的 FakeJudge。
+9. 导出 reviewed_content.xlsx 和 modification_log.xlsx。
+10. 提供 Streamlit 本地人工复核界面和反馈回流功能。
 
----
+## 安装
 
-## 核心功能
+当前开发环境使用 Python 3.13；如果部署环境有 Python 3.11，也可以使用 Python 3.11 创建虚拟环境。
 
-| 功能模块 | 说明 |
-| :--- | :--- |
-| **单条查询** | 输入原始部门名和层级，返回 Top‑3 候选标准名，并显示置信度（高/中/低） |
-| **批量处理** | 上传 Excel 文件（含 `w_name_o` 和 `dtype_t` 列），自动清洗并导出结果，支持进度条 |
-| **部门库管理** | 可视化浏览/搜索现有标准部门，支持在线新增部门及别名，修改即时生效 |
-| **模型训练** | 基于历史人工确认记录，自动训练重排序模型，并输出 Top‑1/Top‑3 准确率评估 |
+~~~bash
+cd /path/to/name-matcher
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+python -m pip check
+python -m pytest -q
+~~~
 
----
-
-## 技术架构
-
-项目采用 **两阶段检索 + 精排** 架构，兼顾准确率和效率：
-
-1. **粗筛（检索）**：使用 TF‑IDF 字符向量对候选部门进行快速过滤，保留 Top‑30 个最相似的候选。
-2. **精排（重排序）**：对 Top‑30 候选计算 **7 个精细特征**（编辑距离、Jaro‑Winkler、LCS 等），然后通过**逻辑回归/随机森林**模型融合成最终相似度得分。
-
-3. **多维语义特征体系**：
-
-引擎将任意名称对映射为一个 **9 维稠密数值向量**，作为底层判定依据。所有特征均基于字符串算法，计算效率极高。
-
-| 特征维度 | 算法实现 | 业务语义 | 应用场景 |
-| :--- | :--- | :--- | :--- |
-| **编辑相似度** | `rapidfuzz.ratio` | 全局最小编辑距离的归一化度量 | 通用基准特征 |
-| **局部匹配分** | `rapidfuzz.partial_ratio` | 检测短文本是否完整包含于长文本 | **简称识别核心**（“发改委”匹配全称） |
-| **词序无关分** | `rapidfuzz.token_sort_ratio` | 忽略分词顺序后的匹配度 | 处理语序错误或字段倒置 |
-| **Jaro-Winkler** | `rapidfuzz.JaroWinkler` | 前缀加权相似度 | 容忍首字录入误差（“广乐” vs “广东”） |
-| **Dice 系数** | 字符 2-gram 集合交并比 | 局部词组重合度 | 捕捉固定组合词（如“财政”、“发改”） |
-| **LCS 比例** | 最长公共子序列长度 / 最大长度 | **顺序保留的字符骨架提取** | **极端缩写场景**（提取“发-改-委”公共骨架） |
-| **TF-IDF 余弦** | 字符级向量空间夹角 | 宏观文本方向一致性 | 一级粗筛，快速排除强无关项 |
-| **长度比例** | 短长比 `min/max` | 文本长度惩罚项 | 防止短词误伤（如“局”匹配“财政局”） |
-| **精确命中** | 布尔标志 | 字符串完全一致 | 别名库命中，零计算开销 |
-
-**亮点**
-- **LCS（最长公共子序列）**：专门针对“发展和改革委员会”→“发改委”这类缩写场景，捕捉保留的公共字符顺序。
-- **Jaro‑Winkler**：对前缀匹配敏感，适合处理“广东”→“广乐”这类首字输入错误。
-
----
-
-## 项目结构
-
-```
-.
-├── matcher.py               # 核心匹配引擎（CodeBook 管理、相似度计算、模型训练）
-├── convert_to_matcher_format.py   # 一个专属于我的调整兼容性的程序，负责把我的数据库的格式转变为matcher所需要的格式
-├── gui.py                   # Tkinter 图形界面（4 个页签）
-├── requirements.txt         # Python 依赖清单
-├── codebook.xlsx            # 【必填】标准部门编码池（初始需手动准备）
-├── training_data.xlsx       # 【可选】历史人工编码记录（用于模型训练）
-├── model.pkl                # 【自动生成】训练后的模型文件
-├── confirmed_log.xlsx       # 【自动生成】每次人工确认的记录
-├── unmatched_log.xlsx       # 【自动生成】用户标记为“无匹配”的记录
-├── matcher.log              # 【自动生成】系统运行日志（审计/排错）
-├── codebook_backups/        # 【自动生成】codebook 自动备份目录（保留最近 20 份）
-└── README.md                # 本文件
-```
-
----
+完整功能需要 pandas、numpy、openpyxl、rapidfuzz、scikit-learn、joblib、LightGBM、jieba、PyYAML、Pydantic、pyarrow、Typer、pytest 和 Streamlit。
 
 ## 快速开始
 
-### 1. 环境准备
+### 审计 codebook
 
-确保 Python 版本 ≥ 3.7，安装依赖：
+~~~bash
+python cli.py audit \
+  --codebook /path/to/codebook.xlsx \
+  --reports-dir reports/codebook_audit
+~~~
 
-```bash
-pip3 install --user --break-system-packages -r requirements.txt
-```
+输出：
 
-`requirements.txt` 内容：
+- codebook_audit.md：总体审计结果；
+- period_conflicts.csv：时间区间重叠、空时间与非空时间混用；
+- notes_need_review.csv：notes 中含年份、撤销、合并、更名、挂牌等关键词的行。
 
-```
-pandas
-numpy
-openpyxl
-rapidfuzz
-scikit-learn
-joblib
-```
+### 训练冷启动模型
 
-### 2. 准备标准部门编码库（`codebook.xlsx`）
+~~~bash
+python cli.py train \
+  --codebook /path/to/codebook.xlsx \
+  --output models/synthetic_ranker.joblib
+~~~
 
-这是系统的“字典”，必须包含以下四列，每行代表一个部门（同一 `dept_id` 可跨层级出现）：
+训练资产记录模型版本、特征哈希、训练规模、模型类型、基线指标和校准方式。合成数据只用于冷启动，不应替代人工标注的 calibration 集和冻结测试集。
 
-| 列名 | 类型 | 说明 | 示例 |
-| :--- | :--- | :--- | :--- |
-| `dept_id` | str | 部门唯一标识（可自定义） | `DEV_REFORM` |
-| `level` | str | 层级：`省级` / `市级` / `县级` | `市级` |
-| `standard_name` | str | 标准全称 | `发改委` |
-| `aliases` | str | 常用别名，用竖线分隔（可留空） | `发改局|发展改革局|发展和改革局` |
+### 批处理
 
-> 若您已有 Word 文档的部门表格，可参考 `tools/` 目录下的辅助脚本进行粗提取，然后人工校对整理。
+~~~bash
+python cli.py run \
+  --codebook /path/to/codebook.xlsx \
+  --input /path/to/input.xlsx \
+  --output-dir outputs \
+  --config config.yaml \
+  --model models/synthetic_ranker.joblib
+~~~
 
-### 3. 启动图形界面
+每次运行建立 outputs/run_<run_id>/，包含：
 
-```bash
-python gui.py
-```
+~~~text
+reviewed_content.xlsx
+modification_log.xlsx
+eval.md
+debug/queries.jsonl
+run_meta.json
+~~~
 
-### 4. 首次使用（无训练模型）
+### 导出人工复核表
 
-系统会自动检测 `model.pkl` 是否存在，若不存在则自动使用**启发式加权算法**（冷启动），此时匹配准确率约 70%~80%，但已可用于日常工作。
+~~~bash
+python cli.py review-export \
+  --input /path/to/input.xlsx \
+  --debug outputs/run_<run_id>/debug/queries.jsonl \
+  --output outputs/run_<run_id>/review_queue.xlsx
+~~~
 
----
+复核表包含系统决策、候选 entity_id、top-3 候选、LLM 理由以及 human_decision、human_entity_id、human_note 等人工字段。人工只能选择 codebook 中的 entity_id，不能自由书写正式字段。
 
-## 详细使用指南
+### 启动 Streamlit
 
-### 一、单条查询页签
+~~~bash
+python cli.py review-ui
+~~~
 
-- 输入**原始部门名**（如“省发改委”）
-- 选择**层级**（如“省级”）
-- 点击 **“查询”** 或按回车键
-- 结果表格显示 Top‑3 候选，**置信度**颜色标识：
-  - 🟢 **高**（≥0.85）：可直接采纳
-  - 🟡 **中**（0.60~0.85）：建议人工复核
-  - 🔴 **低**（<0.60）：极可能不匹配，需核查
-- 若正确候选在列表中，**选中该行** → 点击 **“确认所选结果为正确答案”**，系统会：
-  - 将该原始写法记入对应部门的别名库（下次直接精准命中）
-  - 记录到 `confirmed_log.xlsx`，供后续模型训练使用
-- 若候选均不匹配，点击 **“均不匹配，标记待人工新增”**，系统记录到 `unmatched_log.xlsx`，提醒您后续在部门库中新增该部门。
+界面支持上传 Excel/CSV、运行匹配、分页查看候选、选择 entity_id、confirm/pick/none/hard 以及下载两个主交付文件。
 
-### 二、批量处理页签
+### 回流反馈
 
-- 点击 **“选择待处理 xlsx”**，选择包含 `w_name_o`（原始名称）和 `dtype_t`（层级）两列的 Excel 文件
-- 设定返回候选数 **Top‑K**（默认为 3）
-- 点击 **“开始批量匹配并导出结果”**
-- 进度条显示处理进度，完成后弹出保存对话框
-- 输出结果包含：
-  - 原始列
-  - 前 K 个候选的标准名、`dept_id`、得分、置信度
-  - `_备注` 列（标注“原始名称为空”、“无法识别的 dtype_t”、“未找到候选”等）
+~~~bash
+python cli.py ingest-feedback \
+  --input outputs/run_<run_id>/review_queue.xlsx \
+  --output data/aliases_learned.csv \
+  --operator analyst_1 \
+  --labels data/labels.csv \
+  --cases data/cases.csv
+~~~
 
-> 建议重点关注**置信度=低**或 `_备注` 非空的行，这些是最需要人工复核的数据。
+新别名默认进入 pending_second_review，不会立即改变未来的 exact/alias 规则。只有完成第二审核并标记 approved 后，才适合进入正式生效池。
 
-### 三、部门库管理页签
+## 输入数据契约
 
-- **搜索**：按层级或关键词搜索现有部门，快速查看别名列表
-- **新增部门**：填写 `dept_id`、层级、标准名、别名（可选）→ 点击“添加”，立即生效并自动保存，**无需重启程序**
+常用输入字段：
 
-### 四、模型训练与评估页签
+~~~text
+record_id, year, styr, stmo, fiyr, fimo,
+cityname, distname, dtype, w_name_o, context
+~~~
 
-- 准备 `training_data.xlsx`，必须包含三列：
-  - `w_name_o`：原始名称
-  - `dtype_t`：层级
-  - `dept_id`：正确的部门 ID
-- 选择训练数据文件（默认根目录下的 `training_data.xlsx`）
-- 选择模型类型：
-  - **逻辑回归**（推荐，稳定可解释）
-  - **随机森林**（数据量大时可能更强，但可解释性稍弱）
-- 调整 **验证集比例** 和 **难负例数量**（一般保持默认即可）
-- 点击 **“开始训练 / 重新训练”**
-- 训练完成后，界面会输出 **Top‑1 准确率** 和 **Top‑3 准确率**，并自动保存 `model.pkl`，系统立即切换到新模型。
+- year 只用于上下文和输出，不替代任职时间段判断；
+- styr/stmo/fiyr/fimo 共同构成任职时间段；
+- fiyr 为空但 fimo 非空会标记为非法；
+- cityname 为空时，程序尝试从 w_name_o 前缀识别城市；
+- 没有 record_id 时，程序根据完整源行和重复出现次序生成内部 ID，生产数据建议提供稳定 record_id；
+- context 只作为辅助证据，不用于生成正式字段。
 
-> 建议：当积累了 **200 条以上** 确认记录后，进行一次训练，准确率可提升至 90% 以上；之后每新增 500 条确认记录，可重新训练一次。
+广州组织史数据中存在 dtype_t 这样的替代字段名，当前 config.yaml 已设置 fallback。
 
----
+## Codebook 契约
 
-## 配置参数（可调整）
+codebook 必须包含：
 
-在 `matcher.py` 开头的 `MatcherConfig` 数据类中，可调整以下参数：
+~~~text
+cityname, distname, dtype, drank, s1_sector, wrank,
+w_name, alias, notes,
+year_valid_from, month_valid_from,
+year_valid_to, month_valid_to
+~~~
 
-| 参数 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `stage1_topn` | 30 | 批量模式下，粗筛保留的候选部门数（越大越精确，但速度略慢） |
-| `chunk_size` | 2000 | 批量向量化时每批处理的行数（根据内存调整） |
-| `high_conf_thresh` | 0.85 | 高置信度阈值 |
-| `mid_conf_thresh` | 0.60 | 中置信度阈值 |
+alias 可以使用 ；、;、 、逗号、| 或换行分隔多个别名。
 
-如需修改，直接编辑 `matcher.py` 中的 `CFG` 变量即可。
+时间语义：
 
----
+- 四个有效期字段全为空：该行适用于所有时间；
+- 起始年份有值、起始月份为空：按当年 1 月处理；
+- 结束年份有值、结束月份为空：按当年 12 月处理；
+- 起始年份为空视为负无穷，结束年份为空视为正无穷；
+- notes 的自然语言不会在运行时解析，只进入离线审计报告。
 
-## 数据格式要求
+每行生成：
 
-| 文件 | 必填列 | 说明 |
-| :--- | :--- | :--- |
-| `codebook.xlsx` | `dept_id`, `level`, `standard_name`, `aliases` | `aliases` 中多个别名用 `\|` 分隔 |
-| 批量输入文件 | `w_name_o`, `dtype_t` | `dtype_t` 必须为 `省/地级市/县/区/县级市/经济区/功能区` 之一 |
-| `training_data.xlsx` | `w_name_o`, `dtype_t`, `dept_id` | 每行代表一次人工确认记录 |
+- entity_id = sha256(cityname + norm_w_name + start_year + start_month)[:10]；
+- dept_key = sha256(cityname + norm_w_name)[:10]。
 
----
+entity_id 是最终回填字段的唯一查表键，dept_key 用于把同一部门的不同时间版本归组。
 
-## 训练与评估机制详解
+## 配置文件
 
-系统采用 **难负例挖掘** 训练策略：
+config.yaml 是运行行为的主要入口：
 
-1. 对每条训练样本，用**启发式算法**对所有候选部门排序。
-2. **正样本**：真实答案的特征向量（label=1）
-3. **负样本**：选取启发式得分最高但实际错误的 Top‑K 个候选作为“难负例”（label=0），因为这些是模型最易混淆的案例，训练价值最高。
-4. 模型学习区分这些难例，从而提升排序性能。
+~~~yaml
+audited_fields:
+  - w_name
+  - wrank_t
+  - s1_sector
 
-训练过程中会自动切分验证集，输出 Top‑1/Top‑3 准确率，方便您评估模型效果。
+field_mapping:
+  w_name: w_name
+  wrank_t: wrank
+  s1_sector: s1_sector
+~~~
 
----
+重要配置：
 
-## 日志与备份
+- matching.candidate_k：候选数量；
+- matching.month_tolerance、year_tolerance：时间容差；
+- matching.distname_hard_filter：是否对地区不一致硬过滤；
+- policy.tau_auto、margin_auto、tau_nil：自动、LLM 和人工阈值；
+- models.llm_model、models.llm_budget：LLM 仲裁配置；
+- paths.resource_dir、paths.reports_dir：词表和报告目录。
 
-- **`matcher.log`**：记录所有关键操作（启动、查询、确认、训练、异常），便于审计和故障排查。
-- **`codebook_backups/`**：每次保存 `codebook.xlsx` 前自动备份，保留最近 20 份，防止误操作导致数据丢失。
-- 保存操作采用**临时文件 + 原子替换**，即使程序意外崩溃，原文件也不会损坏。
+## 判定流程
 
----
+~~~text
+输入记录
+  ↓
+规范化、城市识别、多实体识别
+  ↓
+精确、别名、核心词、RapidFuzz、TF-IDF 候选召回
+  ↓
+时间交集、城市、地区、歧义和冲突标记
+  ↓
+特征计算与 LightGBM/逻辑回归排序
+  ↓
+概率校准与 policy 分流
+  ├─ AUTO   → 通过 entity_id 回查 codebook 并回填
+  ├─ HUMAN  → 等待人工复核
+  ├─ LLM    → 候选白名单仲裁，失败则 HUMAN
+  └─ MULTIPLE/NONE → 不强行生成正式字段
+~~~
 
-## 常见问题（FAQ）
+共享别名、时间未知、时间冲突、超出有效期、非法输入时间、地区不一致、城市无法识别、多实体输入和 codebook 时间非法时，不会自动通过。
 
-**Q：没有训练数据时系统能用吗？**  
-A：能。系统会自动使用启发式算法，虽然准确率略低，但完全可用。随着使用逐渐积累确认记录，再训练模型即可。
+## 输出安全规则
 
-**Q：批量处理几万条数据会卡吗？**  
-A：不会。采用两阶段检索，速度极快。但若数据量极大（>50万），建议分批处理或增大 `chunk_size`。
+1. 原始输入文件不会被覆盖。
+2. reviewed_content.xlsx 保留原列、列顺序、行顺序和非目标单元格。
+3. 只有 config.yaml 中 audited_fields 可以被修改。
+4. 正式字段只能通过 entity_id 从 codebook 回查。
+5. 每个目标字段记录 before/after、方法、概率、margin、模型版本和 codebook 版本。
+6. 导出后逐单元格检查非目标列，发现任何变化就拒绝导出。
 
-**Q：如何更新模型？**  
-A：将 `confirmed_log.xlsx` 中的记录追加到 `training_data.xlsx`（注意去重），然后在“模型训练”页签重新训练即可。
+## 代码结构
 
-**Q：程序报错 `CodeBookError` 怎么办？**  
-A：检查 `codebook.xlsx` 是否格式正确，确保 `dept_id` 和 `level` 组合唯一，且 `standard_name` 非空。
+~~~text
+cli.py                    命令行入口
+config.yaml               运行配置
+src/engine/codebook.py    codebook 加载、ID 和审计
+src/engine/normalize.py   名称规范化
+src/engine/index.py       精确、别名、TF-IDF 索引
+src/engine/candidates.py  候选生成和时间逻辑
+src/engine/features.py    字符、分词、时间和组内特征
+src/engine/ranker.py      LightGBM/逻辑回归排序
+src/engine/calibration.py 概率校准和阈值
+src/engine/policy.py      自动/LLM/人工分流
+src/engine/llm_judge.py   LLM 接口、校验、缓存和预算
+src/engine/pipeline.py    批处理和安全导出
+src/engine/feedback.py    复核表和反馈回流
+src/engine/review_app.py  Streamlit 界面
+src/engine/evaluate.py    评估和安全性报告
+tests/                    合成 fixture 和回归测试
+resources/                城市、后缀、冲突词表
+~~~
 
-**Q：我可以完全离线运行吗？**  
-A：可以。所有依赖库均为本地包，无需联网。
+## 测试与审计
 
-好的，我只保留 **Q1** 和 **Q2** 这两个问题，整理成简洁的 Q&A 格式，方便您直接放入 GitHub README。
+~~~bash
+python -m pytest -q
+python cli.py audit --codebook /path/to/codebook.xlsx --reports-dir reports/audit
+python cli.py eval \
+  --debug outputs/run_<run_id>/debug/queries.jsonl \
+  --input /path/to/input.xlsx \
+  --reviewed outputs/run_<run_id>/reviewed_content.xlsx \
+  --log outputs/run_<run_id>/modification_log.xlsx
+~~~
 
-**Q：运行 `python3 gui.py` 时报错 `ModuleNotFoundError: No module named '_tkinter'`，怎么办？**
+测试覆盖 codebook 审计、稳定 ID、共享别名、城市缺失、城市前缀、多实体、核心词召回、非法时间、LLM schema、校准器、非目标列安全校验和人工反馈二审状态。
 
-A：这是 macOS 上通过 Homebrew 安装的 Python 默认**不带 Tkinter（图形界面库）** 导致的。请按以下方案解决：
+## 已知限制
 
-**方案一（推荐）：安装 `python-tk`**
-```bash
-brew install python-tk
-```
-安装完成后，重新运行 `python3 gui.py` 即可。
-
-**方案二：使用 Python 官网安装包**
-1. 访问 [python.org/downloads](https://www.python.org/downloads/)
-2. 下载 macOS 安装包（`.pkg` 文件），**安装时确保勾选 "Install Tcl/Tk"**
-3. 安装后使用 `/Library/Frameworks/Python.framework/Versions/3.x/bin/python3` 运行
-
-**方案三：使用 `pyenv` 安装带 Tk 的 Python**
-```bash
-brew install pyenv tcl-tk
-export LDFLAGS="-L/usr/local/opt/tcl-tk/lib"
-export CPPFLAGS="-I/usr/local/opt/tcl-tk/include"
-pyenv install 3.13.3
-pyenv global 3.13.3
-```
-
-**Q：安装 `python-tk` 时 Homebrew 报错 `undefined method '[]' for nil`，怎么解决？**
-
-A：这通常是 Homebrew 本地缓存损坏或版本不一致导致的。请按以下步骤修复：
-
-**步骤 1：更新并清理 Homebrew**
-```bash
-brew update
-brew cleanup --prune=all
-brew doctor   # 检查是否有其他环境问题
-```
-
-**步骤 2：单独安装依赖项**
-```bash
-# 先单独安装报错的依赖
-brew install ca-certificates
-
-# 再安装 Tcl/Tk 图形库
-brew install tcl-tk
-
-# 最后重新尝试安装 python-tk
-brew install python-tk
-```
-
-**步骤 3（备用）：重置 Homebrew 核心仓库**
-```bash
-cd $(brew --repo homebrew/core)
-git fetch origin
-git reset --hard origin/master
-brew update
-```
-
-**如果以上均无效**，建议直接使用 Q1 中的**方案二（Python 官网安装包）**，完全绕过 Homebrew 的问题。
+- 默认 LLM 是本地 FakeJudge，不访问外部 API。生产环境需要注入真实 judge_fn。
+- 当前模型是合成数据冷启动模型，概率校准应在人工标注的独立 calibration 集上重新训练。
+- 当前版本提供批处理和本地 Streamlit 复核；大规模断点续跑、主动学习选样和新旧模型冻结测试替换仍需进一步工程化。
+- 代码仓库不应提交真实输入数据、个人信息、.venv、输出工作簿和模型缓存；这些文件由 .gitignore 排除。
 
