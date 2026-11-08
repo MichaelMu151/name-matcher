@@ -10,6 +10,13 @@ from .index import IndexEntry, NameIndex
 from .normalize import NormalizedName
 
 
+def _is_broad_party_committee(normalized: NormalizedName) -> bool:
+    """Recognize a generic local party committee by institutional form."""
+    text = normalized.raw.replace(" ", "")
+    excluded = ("纪律检查", "监察", "政法", "宣传", "组织", "统战", "农村", "直属机关", "党校")
+    return "中共" in text and text.endswith("委员会") and not any(term in text for term in excluded)
+
+
 @dataclass(frozen=True)
 class InputPeriod:
     start: int | None
@@ -152,6 +159,35 @@ def generate_candidates(
             candidate_flags.append("alias_ambiguous")
         candidates.append(Candidate(row.entity_id, row.dept_key, row, entry.variant, entry.variant_type, entry.core, path, score, candidate_flags))
         seen.add(row.entity_id)
+    # Fuzzy character similarity cannot reliably recover the semantic class
+    # of names such as “中共广州市第七届委员会”. Add the existing generic
+    # party-committee standard as a conservative human-review candidate.
+    if _is_broad_party_committee(normalized):
+        for row in index.codebook.valid_rows():
+            if row.w_name != "地方党委" or row.entity_id in seen:
+                continue
+            if cityname and not index.codebook.row_applies_to_city(row, cityname):
+                continue
+            candidate_flags = list(flags) + ["policy_broad_party_committee"]
+            applies, overlap_months = _overlap(
+                period, row,
+                month_tolerance=max(0, int(month_tolerance)) + 12 * max(0, int(year_tolerance)),
+            )
+            if applies is False:
+                candidate_flags.append("out_of_period")
+            elif applies is None and not row.all_time_empty:
+                candidate_flags.append("period_unknown")
+            if overlap_months is not None:
+                candidate_flags.append(f"period_overlap_months={overlap_months}")
+            query_dist = str(record.get("distname") or "").strip()
+            if query_dist and row.distname:
+                dist_matches = any(normalize_name(query_dist) == normalize_name(value) for value in Codebook.split_values(row.distname))
+                candidate_flags.append("dist_match" if dist_matches else "dist_mismatch")
+                if not dist_matches and distname_hard_filter:
+                    continue
+            candidates.append(Candidate(row.entity_id, row.dept_key, row, row.w_name, "w_name", row.norm_w_name, "policy", 0.99, candidate_flags))
+            seen.add(row.entity_id)
+            break
     dept_hits: dict[str, int] = {}
     for candidate in candidates:
         if "out_of_period" not in candidate.flags:

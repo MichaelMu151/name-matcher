@@ -70,6 +70,22 @@ class AuditRegressionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Pipeline._validate_preserved_content(source, output, ("w_name",))
 
+    def test_export_validation_handles_duplicate_blank_headers(self) -> None:
+        """Blank Excel headers must be matched by position, not by name."""
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = directory / "source.xlsx"
+            output = directory / "output.xlsx"
+            from openpyxl import Workbook
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["keep", None, None, "w_name"])
+            sheet.append(["x", "a", "b", "old"])
+            workbook.save(source)
+            frame = pd.DataFrame([{ "keep": "x", "Unnamed: 1": "a", "Unnamed: 2": "b", "w_name": "new" }])
+            Pipeline._export_content(source, output, frame, ("w_name",))
+            Pipeline._validate_preserved_content(source, output, ("w_name",))
+
     def test_invalid_codebook_time_is_not_clean_exact(self) -> None:
         normalized = normalize_name("组织部")
         candidates, _ = generate_candidates({"cityname": "测试市", "distname": "甲区"}, self.index, normalized)

@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import zipfile
+import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from openpyxl import load_workbook
+from datetime import date, datetime
 
 from .candidates import generate_candidates
 from .codebook import Codebook, CodebookRow, normalize_name
@@ -22,6 +25,7 @@ from .llm_judge import JudgeError, LLMJudge
 from .normalize import normalize_name as normalize_runtime
 from .policy import Decision, decide
 from .ranker import Ranker
+from .sqlite_cache import QueryCache
 
 
 TARGET_FIELDS = ("w_name", "wrank_t", "s1_sector")
@@ -150,21 +154,36 @@ class Pipeline:
             debug.append(row)
         return decision, debug, flags
 
-    def run(self, input_path: str | Path, output_dir: str | Path = "outputs", run_id: str | None = None) -> dict[str, Any]:
+    def run(self, input_path: str | Path, output_dir: str | Path = "outputs", run_id: str | None = None, progress_callback: Callable[[str, int, int], None] | None = None) -> dict[str, Any]:
+        def progress(stage: str, done: int, total: int) -> None:
+            if progress_callback is not None:
+                progress_callback(stage, done, total)
         input_path = Path(input_path)
         run_id = run_id or datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
         output_dir = Path(output_dir) / run_id
         output_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = Path(self.config["paths"].get("sqlite_cache_dir", "cache"))
+        if not cache_dir.is_absolute():
+            cache_dir = self.config_dir / cache_dir
+        namespace_payload = {
+            "codebook": _version(self.codebook_path),
+            "model": self.ranker.version,
+            "config": self.config,
+        }
+        namespace = hashlib.sha256(json.dumps(namespace_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+        query_cache = QueryCache(cache_dir / "query_cache.sqlite3", namespace)
         if input_path.suffix.lower() == ".csv":
             frame = pd.read_csv(input_path, dtype=object)
         else:
             frame = pd.read_excel(input_path, dtype=object)
+        progress("读取输入文件", 1, 1)
         occurrence: Counter[str] = Counter()
         input_mapping = self.config.get("input_mapping", {})
         record_id_field = str(input_mapping.get("record_id", "record_id"))
         queries: list[dict[str, Any]] = []
         query_keys: list[tuple[Any, ...]] = []
-        for _, row in frame.iterrows():
+        standard_w_names = {normalize_name(row.w_name) for row in self.codebook.valid_rows() if row.w_name}
+        for row_number, (_, row) in enumerate(frame.iterrows(), start=1):
             record_id = str(_clean(row.get(record_id_field)) or self._record_id(row, occurrence["row"]))
             occurrence["row"] += 1
             query = self._query_record(row, record_id)
@@ -176,14 +195,53 @@ class Pipeline:
             key = tuple(key_parts)
             queries.append(query)
             query_keys.append(key)
+            if row_number == 1 or row_number == len(frame) or row_number % 250 == 0:
+                progress("建立查询索引", row_number, len(frame))
 
         unique: dict[tuple[Any, ...], tuple[Decision, list[dict[str, Any]], list[str]]] = {}
         logs: list[dict[str, Any]] = []
         debug_rows: list[dict[str, Any]] = []
-        for query, key in zip(queries, query_keys):
+        for query_number, (query, key) in enumerate(zip(queries, query_keys), start=1):
             if key not in unique:
-                unique[key] = self._process_query(query)
+                cached = query_cache.get(key)
+                if cached is not None:
+                    unique[key] = cached
+                else:
+                    processed = self._process_query(query)
+                    unique[key] = processed
+                    # LLM results are deliberately excluded from the durable
+                    # cache. Rules and ranker decisions are stable under the
+                    # namespace; external model decisions depend on the API
+                    # key, prompt version and service state.
+                    if processed[0].method != "llm":
+                        query_cache.put(key, processed)
             decision, debug, flags = unique[key]
+            source_row = frame.iloc[query_number - 1]
+            existing = {
+                "w_name": _clean(source_row.get("w_name")),
+                "wrank_t": _clean(source_row.get("wrank_t")),
+                "s1_sector": _clean(source_row.get("s1_sector")),
+            }
+            selected = self._selected_row(decision, self.codebook, query) if decision.decision == "AUTO" else None
+            system = {
+                "w_name": selected.w_name if selected else None,
+                "wrank_t": selected.wrank if selected else None,
+                "s1_sector": selected.s1_sector if selected else None,
+            }
+            issue_type = ""
+            issue_fields: list[str] = []
+            if existing["w_name"] not in (None, "") and normalize_name(existing["w_name"]) not in standard_w_names:
+                issue_type = "错误输入"
+            elif decision.decision == "AUTO":
+                for field in ("w_name", "wrank_t", "s1_sector"):
+                    if existing[field] not in (None, "") and str(existing[field]).strip() != str(system[field] or "").strip():
+                        issue_fields.append(field)
+                if issue_fields:
+                    issue_type = "有冲突"
+                elif any(existing[field] in (None, "") for field in ("w_name", "wrank_t", "s1_sector")):
+                    issue_type = "缺失输入"
+            else:
+                issue_type = "多种可能"
             debug_rows.append({
                 "record_id": query["record_id"],
                 "query_key": "|".join("" if value is None else str(value) for value in key),
@@ -202,24 +260,45 @@ class Pipeline:
                 "p_calibrated": decision.p_calibrated,
                 "margin": decision.margin,
                 "reason": decision.reason,
+                "existing_w_name": existing["w_name"],
+                "existing_wrank_t": existing["wrank_t"],
+                "existing_s1_sector": existing["s1_sector"],
+                "issue_type": issue_type,
+                "issue_fields": ";".join(issue_fields),
+                "review_reason": (f"{issue_type}（字段：{';'.join(issue_fields)}）" if issue_type == "有冲突" and issue_fields else issue_type),
+                "system_w_name": system["w_name"],
+                "system_wrank_t": system["wrank_t"],
+                "system_s1_sector": system["s1_sector"],
+                "candidate_count": len(debug),
+                "top1_probability": debug[0].get("probability", 0.0) if debug else 0.0,
+                "top2_probability": debug[1].get("probability", 0.0) if len(debug) > 1 else 0.0,
                 "flags": flags,
                 "top3_candidates": debug[:3],
                 "candidate_ids": [candidate.get("entity_id", "") for candidate in debug],
             })
+            if query_number == 1 or query_number == len(queries) or query_number % 100 == 0:
+                progress("匹配与候选裁决", query_number, len(queries))
 
         result = frame.copy()
         for target in self.target_fields:
             if target not in result.columns:
                 result[target] = ""
         logs.extend(self._build_logs(frame, queries, query_keys, unique, run_id))
+        # post_rank is deliberately deferred until after human review and the
+        # temporal validity stage in the desktop workflow.
         self._apply_decisions(result, queries, query_keys, unique)
         reviewed = output_dir / self.config["ui"]["export_files"]["content"]
         log_path = output_dir / self.config["ui"]["export_files"]["log"]
         self._export_content(input_path, reviewed, result, self.target_fields)
+        progress("导出 Excel", 1, 1)
         self._validate_preserved_content(input_path, reviewed, self.target_fields)
+        progress("安全校验", 1, 1)
         pd.DataFrame(logs).to_excel(log_path, index=False)
         (output_dir / "debug").mkdir(exist_ok=True)
-        pd.DataFrame(debug_rows).to_json(output_dir / "debug" / "queries.jsonl", orient="records", lines=True, force_ascii=False)
+        debug_frame = pd.DataFrame(debug_rows)
+        debug_frame.to_json(output_dir / "debug" / "queries.jsonl", orient="records", lines=True, force_ascii=False)
+        debug_frame[debug_frame["issue_type"].astype(str).str.strip() != ""].to_excel(output_dir / "review_queue.xlsx", index=False)
+        query_cache.close()
         meta = {
             "run_id": run_id,
             "input": str(input_path),
@@ -235,16 +314,32 @@ class Pipeline:
             "input_rows": len(frame),
         }
         (output_dir / "run_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        return {"run_id": run_id, "output_dir": str(output_dir), "input_rows": len(frame), "unique_queries": len(unique), "reviewed_content": str(reviewed), "modification_log": str(log_path)}
+        return {"run_id": run_id, "output_dir": str(output_dir), "input_path": str(input_path), "input_rows": len(frame), "unique_queries": len(unique), "reviewed_content": str(reviewed), "modification_log": str(log_path), "review_queue": str(output_dir / "review_queue.xlsx")}
 
     @staticmethod
-    def _selected_row(decision: Decision, codebook: Codebook) -> CodebookRow | None:
-        return codebook.row_for_entity(decision.entity_id) if decision.entity_id else None
+    def _selected_row(decision: Decision, codebook: Codebook, query: dict[str, Any] | None = None) -> CodebookRow | None:
+        if not decision.entity_id:
+            return None
+        rows = codebook.rows_for_entity(decision.entity_id)
+        if not rows:
+            return None
+        if query:
+            try:
+                year = int(float(query.get("year"))) if query.get("year") not in (None, "") else None
+                month = int(float(query.get("stmo"))) if query.get("stmo") not in (None, "") else 6
+            except (TypeError, ValueError):
+                year, month = None, 6
+            if year is not None:
+                key = year * 12 + max(1, min(12, month)) - 1
+                in_period = [row for row in rows if row.start_month <= key <= row.end_month]
+                if in_period:
+                    rows = in_period
+        return rows[0]
 
     def _apply_decisions(self, result: pd.DataFrame, queries: list[dict[str, Any]], keys: list[tuple[Any, ...]], unique: dict[tuple[Any, ...], tuple[Decision, list[dict[str, Any]], list[str]]]) -> None:
         for index, key in enumerate(keys):
             decision = unique[key][0]
-            row = self._selected_row(decision, self.codebook)
+            row = self._selected_row(decision, self.codebook, queries[index])
             if row is None or decision.decision not in {"AUTO"}:
                 continue
             for target in self.target_fields:
@@ -255,7 +350,7 @@ class Pipeline:
         logs: list[dict[str, Any]] = []
         for index, (query, key) in enumerate(zip(queries, keys)):
             decision = unique[key][0]
-            row = self._selected_row(decision, self.codebook)
+            row = self._selected_row(decision, self.codebook, queries[index])
             values = {
                 target: (getattr(row, self.field_mapping[target]) if row and decision.decision == "AUTO" else _clean(frame.iloc[index].get(target)))
                 for target in self.target_fields
@@ -284,14 +379,125 @@ class Pipeline:
                 headers[target] = next_col
                 sheet.cell(1, headers[target]).value = target
                 next_col += 1
+        auxiliary_fields = [field for field in ["post_rank", "post_rank_original", "post_rank_adjustment_reason", "post_rank_adjustment_status"] if field in result.columns]
         for row_index, (_, row) in enumerate(result.iterrows(), start=2):
-            for target in target_fields:
+            for target in list(target_fields) + [field for field in auxiliary_fields if field not in target_fields]:
+                if target not in headers:
+                    headers[target] = next_col
+                    sheet.cell(1, headers[target]).value = target
+                    next_col += 1
                 sheet.cell(row_index, headers[target]).value = _clean(row.get(target))
         workbook.save(output_path)
 
     @staticmethod
     def _validate_preserved_content(input_path: Path, output_path: Path, target_fields: tuple[str, ...]) -> None:
         """Fail closed if any non-audited cell changed during export."""
+
+        # These columns are explicitly generated by the post_rank linkage
+        # feature.  They are audited outputs, not accidental modifications to
+        # the user's original non-target columns.
+        generated_fields = {"post_rank", "post_rank_original", "post_rank_adjustment_reason", "post_rank_adjustment_status"}
+
+        # For Excel inputs compare the workbook cells directly.  A pandas
+        # round-trip can coerce an integer-looking year to float or convert a
+        # date serial, which would create a false safety failure even though
+        # the copied workbook cell was untouched.
+        if input_path.suffix.lower() == ".xlsx" and output_path.suffix.lower() == ".xlsx":
+            def column_number(cell_ref: str) -> int:
+                letters = "".join(character for character in cell_ref.split("$")[0] if character.isalpha())
+                number = 0
+                for character in letters.upper():
+                    number = number * 26 + ord(character) - 64
+                return number
+
+            def xml_value(cell: ET.Element, shared_strings: list[str]) -> tuple[str, str]:
+                cell_type = cell.attrib.get("t", "")
+                if cell_type == "inlineStr":
+                    value = "".join(node.text or "" for node in cell.iter() if node.tag.rsplit("}", 1)[-1] == "t")
+                    return ("none", "") if value == "" else ("str", value)
+                value_node = next((node for node in cell if node.tag.rsplit("}", 1)[-1] == "v"), None)
+                value = "" if value_node is None or value_node.text is None else value_node.text
+                if cell_type == "s":
+                    try:
+                        return ("str", shared_strings[int(value)])
+                    except (ValueError, IndexError):
+                        return ("str", value)
+                if cell_type == "b":
+                    return ("bool", "1" if value == "1" else "0")
+                if cell_type == "str":
+                    return ("none", "") if value == "" else ("str", value)
+                if value:
+                    try:
+                        numeric = float(value)
+                        if numeric.is_integer():
+                            value = str(int(numeric))
+                    except ValueError:
+                        pass
+                formula = next((node for node in cell if node.tag.rsplit("}", 1)[-1] == "f"), None)
+                if formula is not None:
+                    # openpyxl can expand Excel shared formulas into ordinary
+                    # formulas when saving a copied workbook. Both forms are
+                    # still formula cells; cached values and XML storage form
+                    # are not reliable evidence that a non-target cell changed.
+                    return ("formula", "")
+                return ("none", "") if value == "" else ("number", value)
+
+            def extract(path: Path) -> tuple[list[str], int, dict[str, tuple[str, str]]]:
+                with zipfile.ZipFile(path) as archive:
+                    shared: list[str] = []
+                    if "xl/sharedStrings.xml" in archive.namelist():
+                        root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                        for item in root:
+                            if item.tag.rsplit("}", 1)[-1] == "si":
+                                shared.append("".join(node.text or "" for node in item.iter() if node.tag.rsplit("}", 1)[-1] == "t"))
+                    sheet_name = sorted(name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))[0]
+                    headers: list[str] = []
+                    cells: dict[str, tuple[str, str]] = {}
+                    max_row = 0
+                    with archive.open(sheet_name) as stream:
+                        for _, row in ET.iterparse(stream, events=("end",)):
+                            if row.tag.rsplit("}", 1)[-1] != "row":
+                                continue
+                            row_number = int(row.attrib.get("r", "0"))
+                            max_row = max(max_row, row_number)
+                            for cell in row:
+                                if cell.tag.rsplit("}", 1)[-1] != "c" or "r" not in cell.attrib:
+                                    continue
+                                reference = cell.attrib["r"]
+                                value = xml_value(cell, shared)
+                                if row_number == 1:
+                                    while len(headers) < column_number(reference):
+                                        headers.append("")
+                                    headers[column_number(reference) - 1] = value[1]
+                                cells[reference] = value
+                            row.clear()
+                    return headers, max_row, cells
+
+            source_headers, source_rows, source_cells = extract(input_path)
+            output_headers, output_rows, output_cells = extract(output_path)
+            source_preserved_headers = [header for header in source_headers if header not in target_fields and header not in generated_fields]
+            output_preserved_headers = [header for header in output_headers if header not in target_fields and header not in generated_fields]
+            if source_preserved_headers != output_preserved_headers:
+                raise ValueError("导出安全校验失败：非目标列集合或顺序发生变化")
+            if source_rows != output_rows:
+                raise ValueError("导出安全校验失败：行数发生变化")
+            source_preserved = {
+                reference: value
+                for reference, value in source_cells.items()
+                if column_number(reference) <= len(source_headers) and source_headers[column_number(reference) - 1] not in target_fields and source_headers[column_number(reference) - 1] not in generated_fields
+            }
+            output_preserved = {
+                reference: value
+                for reference, value in output_cells.items()
+                if column_number(reference) <= len(output_headers) and output_headers[column_number(reference) - 1] not in target_fields and output_headers[column_number(reference) - 1] not in generated_fields
+            }
+            for reference in sorted(set(source_preserved) | set(output_preserved)):
+                if source_preserved.get(reference, ("none", "")) != output_preserved.get(reference, ("none", "")):
+                    header = source_headers[column_number(reference) - 1] if column_number(reference) <= len(source_headers) else reference.rstrip("0123456789")
+                    display_header = header or f"Unnamed: {column_number(reference) - 1}"
+                    row_number = "".join(character for character in reference if character.isdigit())
+                    raise ValueError(f"导出安全校验失败：{display_header}!{row_number} 被修改")
+            return
 
         def read(path: Path) -> pd.DataFrame:
             if path.suffix.lower() == ".csv":
@@ -302,8 +508,8 @@ class Pipeline:
         exported = read(output_path)
         if len(source) != len(exported):
             raise ValueError("导出安全校验失败：行数发生变化")
-        source_non_target = [column for column in source.columns if column not in target_fields]
-        exported_non_target = [column for column in exported.columns if column not in target_fields]
+        source_non_target = [column for column in source.columns if column not in target_fields and column not in generated_fields]
+        exported_non_target = [column for column in exported.columns if column not in target_fields and column not in generated_fields]
         if source_non_target != exported_non_target:
             raise ValueError("导出安全校验失败：非目标列集合或顺序发生变化")
         for column in source_non_target:

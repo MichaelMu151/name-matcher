@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +35,81 @@ class FakeJudge:
 
     def __call__(self, query: dict[str, Any], candidates: list[dict[str, Any]], rules: list[str], examples: list[dict[str, Any]]) -> dict[str, Any]:
         return {"decision": self.default, "reason": "FakeJudge 默认结果", "rule_refs": [], "uncertain": True}
+
+
+class DeepSeekJudge:
+    """OpenAI-compatible DeepSeek judge with a strict JSON-only contract.
+
+    The API key is held only in memory by the callable. It is never written to
+    the cache or logs. Network failures deliberately raise ``JudgeError`` so
+    the pipeline routes the case to HUMAN instead of guessing.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "deepseek-chat",
+        base_url: str = "https://api.deepseek.com",
+        timeout: float = 30.0,
+    ):
+        self.api_key = api_key.strip()
+        self.model = model.strip() or "deepseek-chat"
+        self.base_url = base_url.rstrip("/")
+        self.timeout = float(timeout)
+        if not self.api_key:
+            raise ValueError("DeepSeek API key 不能为空")
+
+    @staticmethod
+    def _system_prompt() -> str:
+        return (
+            "你是政府部门名称编码审核器。只能在候选 entity_id 中选择，或返回 NONE、MULTIPLE、"
+            "NOT_A_DEPARTMENT。绝不能创造候选、改写正式部门名称、推断候选之外的 entity_id，"
+            "也不能因为名称相似而忽略城市、级别、时间和部门类型冲突。若证据不足、候选冲突、"
+            "或无法区分，必须将 uncertain 设为 true。只输出一个 JSON 对象，不要 Markdown。"
+            "字段必须是 decision、reason、rule_refs、uncertain；reason 不超过 80 个汉字，"
+            "rule_refs 是字符串数组。"
+        )
+
+    def __call__(self, query: dict[str, Any], candidates: list[dict[str, Any]], rules: list[str], examples: list[dict[str, Any]]) -> dict[str, Any]:
+        user_payload = {"query": query, "candidates": candidates, "rules": rules, "examples": examples}
+        body = {
+            "model": self.model,
+            "temperature": 0,
+            "max_tokens": 300,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": self._system_prompt()},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, default=str)},
+            ],
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+            raise JudgeError(f"DeepSeek API HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise JudgeError(f"DeepSeek API 请求失败: {exc}") from exc
+        try:
+            content = payload["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content)
+            raw = json.loads(str(content).strip())
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise JudgeError("DeepSeek 返回格式不是可解析的 JSON") from exc
+        if not isinstance(raw, dict):
+            raise JudgeError("DeepSeek 返回的 JSON 不是对象")
+        return raw
 
 
 class LLMJudge:

@@ -26,6 +26,10 @@ def decide(candidates: list[Candidate], probabilities: list[float], query_flags:
         return Decision("HUMAN", None, "policy", 0.0, 0.0, "输入任职时间组合非法", flags)
     if not candidates:
         return Decision("NONE", None, "policy", 0.0, 0.0, "没有候选", flags)
+    semantic_party = [candidate for candidate in candidates if "policy_broad_party_committee" in candidate.flags]
+    blocked_semantic = {"out_of_period", "period_ambiguous", "period_unknown", "dist_mismatch", "city_missing", "codebook_period_invalid", "input_period_invalid"}
+    if len(semantic_party) == 1 and not (blocked_semantic & set(semantic_party[0].flags)):
+        return Decision("HUMAN", semantic_party[0].entity_id, "policy", 1.0, 1.0, "规则提示：名称形式符合地方党委，建议人工确认", flags)
     if len(probabilities) != len(candidates):
         return Decision("HUMAN", None, "policy", 0.0, 0.0, "候选与模型分数数量不一致", flags)
     probabilities = [min(1.0, max(0.0, float(value))) for value in probabilities]

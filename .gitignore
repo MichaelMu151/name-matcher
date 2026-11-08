@@ -13,6 +13,8 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+*.tmp
+*.before_human_batch.bak
 
 # Research data and generated artifacts
 *.xlsx
@@ -23,7 +25,9 @@ data/
 reports/*
 !reports/.gitkeep
 reports/llm_cache.jsonl
+cache/
 models/*.joblib
 models/*.pkl
 *.bak
+data/pending_review.json
 

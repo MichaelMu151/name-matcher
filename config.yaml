@@ -45,3 +45,4 @@ models:
 paths:
   reports_dir: reports
   resource_dir: resources
+  sqlite_cache_dir: cache

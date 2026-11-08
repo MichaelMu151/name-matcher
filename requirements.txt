@@ -12,3 +12,4 @@ jieba
 typer
 pytest
 streamlit
+PySide6-Essentials

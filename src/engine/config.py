@@ -15,7 +15,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "policy": {"tau_auto": 0.85, "margin_auto": 0.10, "tau_nil": 0.15, "alpha": 0.02},
     "input_mapping": {"record_id": "record_id", "year": "year", "dtype": "dtype", "dtype_fallback": "dtype_t", "context_fields": ["p_name", "post1", "context"]},
     "models": {"default_version": "synthetic_ranker", "llm_model": "fake", "llm_budget": 100},
-    "paths": {"reports_dir": "reports", "resource_dir": "resources"},
+    "paths": {"reports_dir": "reports", "resource_dir": "resources", "sqlite_cache_dir": "cache"},
 }
 
 
