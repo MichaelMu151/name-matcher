@@ -1,113 +1,84 @@
-# 政府部门名称编码与人工审核引擎
+# 政府部门名称编码与组织史数据审核程序
 
-这是一个面向广州、深圳及其他地区组织史数据的部门名称标准化与审核程序。它将输入 Excel 中的历史部门名称，与 `codebook.xlsx` 中维护的标准部门名称、别名、部门类别、部门级别和有效期进行比较，并把结果分成自动编码、人工审核、名称有效期问题和多种可能等不同路径。
+本项目用于把组织史原始 Excel 中的部门名称和部门级别，与研究者维护的 `codebook.xlsx` 对照，并以可复核、可追溯的方式完成部门编码、历史有效期处理和职位级别核查。程序把自动匹配、人工决定、有效期扩充和最终人工修改分成连续阶段。标准部门名称、类别和部门级别以 codebook 为准；任何不确定或冲突的结果都会保留为审核事项。
 
-程序的设计目标不是“猜一个最像的名称”，而是让每一个正式编码都可以追溯到 codebook 中的具体记录，并让不确定结果进入人工审核。
+本说明按实际操作顺序解释每一步：输入什么、程序如何判断、产生什么文件、哪些地方需要人工决定。配套的详细图示见 [`docs/workflow.svg`](docs/workflow.svg)；PNG 版本见 [`docs/workflow.png`](docs/workflow.png)。
 
-## 主要用途
-
-- 审核输入数据的 `w_name` 是否属于 codebook 的标准名称池。
-- 使用 `w_name_o` 召回标准部门名称候选。
-- 检查 `cityname`、`distname` 与 codebook 的适用范围。
-- 比较输入已有的 `w_name`、`wrank_t`、`s1_sector` 与系统判断。
-- 识别错误输入、字段冲突、多种可能和缺失编码。
-- 根据 codebook 的有效期发现旧部门名称超出使用年份的情况。
-- 处理部门级别、类别和名称在年份或月份节点上的变化。
-- 根据最终确定的部门级别调整人员 `post_rank`。
-- 将人工选择保存为 alias、反馈记录和后续可追踪的审核日志。
-
-## 处理顺序
-
-程序严格按照以下顺序工作：
+## 全流程一览
 
 ```text
-输入 Excel 与 codebook
-        ↓
-系统召回候选并生成初步审核队列
-        ↓
-人工复核 w_name / s1_sector / wrank_t
-        ↓
-检查 w_name 是否处于 codebook 有效期
-        ↓
-处理级别、类别和名称的年份/月度变动
-        ↓
-根据最终 wrank_t 调整 post_rank
-        ↓
-导出 reviewed_content、审核队列和修改日志
+原始 Excel + codebook
+  → 首次配置与匹配
+  → 第一遍人工审核 w_name / s1_sector / wrank_t
+  → 保存“人工复核完成”阶段文件
+  → 重新上传阶段文件并按 codebook 地域范围核对
+  → 判断是否存在有效期变化
+       ├─ 没有：wrank20 = wrank_t，生成阶段文件
+       └─ 有：按有效期填充、必要时扩行、按 2020 有效段填 wrank20，生成阶段文件
+  → 上传当前阶段文件，进行 post_rank 预审
+  → 人工修改 post_rank 并保存阶段文件
+  → 最终一致性检查与最终成稿
 ```
 
-### 1. 人工复核
+每一个“阶段文件”都作为下一步的输入，便于保留过程版本和定位差异。原始数据、阶段文件和最终成稿应分别保存；不要把中间结果直接覆盖原始文件。
 
-人工复核以名称组为单位进行。同一个 `w_name_o` 的多条记录会合并在候选卡片中，确认一次即可应用到该名称组的原始行。
+## 1. 输入和首次运行配置
 
-每一次选择都会立即写入本地暂存文件 `data/pending_review.json`。只有点击“保存本批复核结果”后，才会更新原始 Excel、`reviewed_content.xlsx` 和 codebook。
+开始运行前，需要准备原始组织史 Excel 和适用于本批资料的 codebook。开始界面要求选择原始数据路径、codebook 路径，并填写年鉴起点年月和终点年月。年鉴时间用于判断当前数据的观察范围，在有效期扩充时临时补齐缺失的任职起止年月。程序只在内部计算时补值，原始字段缺失状态会在输出前恢复；由有效期节点产生的拆分边界则会保留。若不使用 DeepSeek，可选择本地规则与排序流程；若使用 API，应在界面输入 Key，不要把 Key 写入代码或提交到仓库。
 
-人工选择可以是：
-
-- 确认系统建议；
-- 选择候选卡片；
-- 保留输入中已经存在的编码；
-- 手动新增标准名称；
-- 无法匹配；
-- 跳过并稍后处理。
-
-### 2. 名称有效期检查
-
-如果一个标准名称只在某一时间段有效，程序会把年份超出有效区间的记录单独列为 `w_name超出有效期`。
-
-例如 `专利管理局` 的 codebook 有效期截止到 2001 年，但输入数据在 2002 年仍使用这个名称，程序不会擅自改成新名称，而是把它放入人工审核队列。
-
-相关问题包括：
-
-- `w_name超出有效期`；
-- `w_name有效期无法判断`；
-- 同一名称和年份对应多个不同编码的 `多种可能`。
-
-### 3. 级别、类别和名称变动
-
-对于处于有效期内的部门，程序依据 `year_valid_from/to` 和 `month_valid_from/to` 选择对应的 codebook 记录：
-
-- 只有年份边界时，按年份填充，不复制年度行；
-- 有月份边界时，使用 `styr/stmo` 与 `fiyr/fimo` 判断任职区间；
-- 任职跨越月份节点时，在变动审阅结果中展示变化前后区间；
-- 级别未变化但 `wrank20 != wrank_t` 时，标记为 `级别没变但是wrank不统一`。
-
-旧名称在有效期外不会被当作普通级别变化自动修正。
-
-### 4. post_rank 联动
-
-只有前面步骤确定了最终 `wrank_t` 后，程序才会调整 `post_rank`。
-
-内部计算使用统一的等级序列：
+原始数据常用字段为：
 
 ```text
-副股级 → 股级 → 副科级 → 科级 → 副处级 → 处级
-→ 副厅级 → 地厅级 → 副部级 → 省部级
+record_id, year, cityname, distname,
+w_name_o, w_name, s1_sector, wrank_t, wrank20,
+p_name, post1, post_rank, styr, stmo, fiyr, fimo
 ```
 
-历史数据中的名称会统一解释：
+其中 `w_name_o` 是原始名称，`w_name` 是标准化部门名称；`s1_sector` 是部门类别；`wrank_t` 是该条记录或有效期段对应的部门级别；`wrank20` 表示 2020 年部门级别；`post1` 是职位名称；`post_rank` 是数据中记录的个人职位级别。稳定的 `record_id` 有助于逐行追溯；没有该字段时，程序依赖源表行号等内部标识定位。
 
-- `科级` = `正科级`；
-- `处级` = `正处级`；
-- `厅级`、`地厅级` = `正厅级`；
-- `省部级` = `正部级`。
+## 2. 读取 codebook、索引和第一遍人工审核
 
-例如部门级别从 `副厅级` 变为 `处级`，变化量为 -1：
+程序读取原始数据和 codebook 后，按标准名称、alias、地域范围、有效期、部门级别和类别组织查找索引。`w_name` 是唯一的标准名称来源；真实资料中出现的其他叫法只能作为 alias。alias 用于召回候选，不能因此把别名当成新的标准名称。地域字段用于限制候选适用范围；codebook 的 `cityname` 或 `distname` 若为空，则该字段不限制范围。多值范围按 codebook 中的分隔格式拆分后逐项匹配。
 
-- `post_rank=副厅级` → `处级`；
-- `post_rank=处级` → `副处级`。
+系统随后根据原始 `w_name_o` 和现有编码生成候选卡片。相同 `w_name_o` 的记录会合并成名称组，以减少重复审核；卡片中仍应展示组内记录的地区、年份、当前编码等上下文，人工需确认这些记录确实适用同一标准编码。研究者逐项确认 `w_name`、`s1_sector` 和 `wrank_t`，可以选择系统候选，也可以确认输入已有值或按界面规则处理无法匹配的记录。选择先进入本批暂存区，审核者可以回看、编辑或删除暂存项；点击“保存本批复核结果”后，程序才写出人工复核阶段文件，并按当前工作流保留审核状态与日志。
 
-程序会保留：
+第一阶段文件是后续有效期处理的基线。它记录第一遍人工审核后确定的名称、类别和级别，后续步骤应从这个文件继续，而不是重新上传未审核的原始文件。
 
-- `post_rank_original`；
-- `post_rank_adjustment_reason`；
-- `post_rank_adjustment_status`。
+## 3. 上传人工复核文件并确定审核范围
 
-无法识别的职位级别、调整后超出范围的级别不会被强行修改，而会保留原值并标记为待审核。
+将第一阶段“人工复核完成”文件加载到变动审核模块后，程序重新读取当前 codebook，并逐行检查数据记录的 `cityname`、`distname` 是否落在 codebook 表示的范围内。只有地域范围匹配的记录进入后续审核；该范围由本次使用的 codebook 决定，不固定为广州或某个预设城市。codebook 中多值地域会逐项匹配，空白地域字段作为该维度的通配条件。
 
-## 安装
+随后程序根据数据中的 `w_name`（必要时结合原始名称 alias）查找适用的 codebook 记录，并判断该部门是否具有有效期信息。有效期字段为 `year_valid_from/to` 和 `month_valid_from/to`。四项均空表示没有时间分段；存在时间边界表示部门至少有一个历史适用段。若同一名称和地域下有多条有效期记录，程序会结合数据年份、任职起止时间及 codebook 边界定位适用段。缺少月份时，年鉴起止时间用于临时补全任职边界；codebook 起始月份缺失按年初解释，结束月份缺失按年末解释。若数据缺少关键年份或有效期段相互冲突，程序应将该记录列为问题供人工判断，不应把不确定结果当作已确认编码。
 
-建议使用 Python 3.11–3.13：
+## 4. 无有效期变化分流：同步 2020 年级别
+
+如果某部门在当前地域范围内没有有效期变化，程序按既定规则把 `wrank20` 设为本条人工审核后的 `wrank_t`，并生成无变化部门阶段文件。`w_name`、`s1_sector`、`wrank_t` 和 `wrank20` 的变动应能通过阶段前后文件及审核日志核对；源文件中的其他研究字段不应因这一步改变。这个分流让没有历史级别分段的部门，其 2020 年部门级别与当前 codebook 级别保持一致。
+
+如 codebook 级别标为 `00待处理` 等待定值，不能把它当作通常等级参加职位级别运算。项目还保留了将 codebook 中待处理部门对应数据行的 `wrank20` 统一标记为 `00待处理` 的阶段处理规则；该处理会生成独立副本，并显示处理行数，不应覆盖上传文件。
+
+## 5. 有效期变化分流：按时间段填充并处理跨节点任职
+
+有有效期记录的部门进入部门扩充模块。程序以年鉴起止年月为观察边界，临时填补缺少的 `styr/stmo/fiyr/fimo`，再用 codebook 的有效期段为每个部门确定当时适用的 `w_name`、`s1_sector` 和 `wrank_t`。如果任职区间完全落在单一有效期段内，使用该段编码；若任职区间跨越明确的月份变化节点，则将跨节点的年度记录拆成变化前后两段。变化节点所在年份的边界采用节点年月：变化前段结束于该年月，变化后段开始于同一年月，因为资料只精确到月份，无法知道该月具体哪一天发生变化。扩行结果保留源记录关联信息，并在拆分日志中记录源行、分段起止时间和对应编码，便于追查每一行的来历。
+
+临时补出的任职日期用于计算后会恢复为原始空值；真实由节点划分出来的边界仍保留，以表达拆分结果。遇到没有明确月份、有效期重叠、任职年月不完整或无法定位有效段的情况，程序应生成问题记录供人工检查。对这些情形，不能仅凭部门名称自动推定历史变化。
+
+当扩充结束后，程序按 codebook 中覆盖 2020 年的有效期段填充 `wrank20`。例如住房公积金管理中心 2009 年 2 月前为副厅级、从 2009 年 2 月起为处级，2020 年落在后段，因此扩充结果的 `wrank20` 为处级。没有有效期变化的部门不通过这个规则选段；其 `wrank20` 已在上一分流按 `wrank_t` 同步。有效期分流结果输出为独立的部门扩充阶段文件，包含处理结果、问题清单和拆分日志等工作表。人工审核者应先查看这些结果，再把该阶段文件上传到下一步。
+
+## 6. post_rank 预审：从职位名称和部门级别推导理论值
+
+上传当前阶段文件后，post_rank 预审只在 codebook 确定的地域范围内运行，并读取当前最终化的 `wrank_t`、职位名称 `post1` 和原始 `post_rank`。程序使用 [`src/engine/post_rank_mapping.py`](src/engine/post_rank_mapping.py) 中从 [`resources/4post_rank.R`](resources/4post_rank.R) 转录维护的四组职位词表，将能识别的职位归入四类：部门党政领导、部门副领导、二级局及类似机构党政领导、二级局及类似机构党政副手。当前映射约定这四类依次对应 `rank1`、`rank2`、`rank3`、`rank4`。
+
+程序将 `wrank_t` 规范到统一的级别序列，再按职位组次序向下推导：`rank1` 等于部门级别，`rank2` 比部门级别低一级，`rank3` 低两级，`rank4` 低三级。例如 `wrank_t=副厅级` 时，四档理论级别依次为副厅级、处级、副处级、科级。历史级别写法会归一后比较，例如“处级”按正处级比较，“地厅级”按正厅级比较；输出显示名称沿用数据所需写法。若推导结果超出当前级别序列下限或 `wrank_t` 无法识别，则结果进入待人工处理状态。
+
+推导出的理论级别与原 `post_rank` 比较。相同的记录标记为一致；不同的记录作为 `post_rank 不一致` 问题展示；职位名称不在词表中的记录列为“职位名称无法识别”；部门级别无法规范化的记录列为“部门级别无法判断”；缺少原 `post_rank` 的记录单独标出。post_rank 预审输出的是核查结果和建议，不自动更改原始 `post_rank`。研究者在 Excel 中根据原始资料人工修改，并把修改后的文件作为下一阶段输入。词表是明示规则，因此职位名称的匹配可追查；新增、合并或修改职位类别时，应同步更新词表并保留版本记录。
+
+## 7. 人工修改与最终一致性检查
+
+研究者在 post_rank 阶段文件中人工处理不一致与未知职位，保存为新的 Excel，再加载到最终检查步骤。最终检查逐项核对 `w_name`、`s1_sector`、`wrank_t`、`wrank20` 和 `post_rank`，确认人工审核与变动扩充后的字段之间没有明显冲突，并保留原始字段、修改字段和问题说明供复查。最终成稿以人工确认的文件为依据；程序输出的“建议”不等于研究者已经批准的修改。
+
+## 8. 运行方法
+
+推荐 Python 3.11–3.13，并在项目目录建立虚拟环境：
 
 ```bash
 cd /path/to/wname_matcher
@@ -115,174 +86,92 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
-python -m pip check
-```
-
-运行测试：
-
-```bash
-python -m pytest -q
-```
-
-当前测试覆盖 codebook 审计、候选匹配、导出安全校验和 `post_rank` 联动逻辑。
-
-## 推荐使用方式：PySide6 桌面界面
-
-```bash
 python run_qt.py
 ```
 
-界面主要页面：
-
-1. **开始运行**：选择输入 Excel、`codebook.xlsx`、配置文件和可选模型；
-2. **结果预览**：查看系统判断、字段冲突和问题类型；
-3. **人工复核**：按名称组打开候选卡片，修改并暂存审核；
-4. **变动审阅**：查看 codebook 中经历过名称、类别或级别变化的部门，检查名称有效期问题和 `post_rank` 示例；
-5. **使用说明**：查看操作规则和输出文件说明。
-
-首次使用建议：
-
-1. 选择输入数据和 codebook；
-2. 点击“开始运行”；
-3. 进入“人工复核”，逐组处理候选；
-4. 在“本批暂存”表检查选择；
-5. 点击“保存本批复核结果”；
-6. 再检查“变动审阅”中的名称有效期问题；
-7. 查看输出目录中的审核队列和 `post_rank` 调整日志。
-
-如果保存时出现 alias 冲突，程序会保存无冲突记录，并把冲突记录留在暂存区，而不会整批丢失。
-
-## 命令行用法
-
-### 审计 codebook
-
-```bash
-python cli.py audit \
-  --codebook /path/to/codebook.xlsx \
-  --reports-dir reports/codebook_audit
-```
-
-### 训练冷启动排序模型
-
-```bash
-python cli.py train \
-  --codebook /path/to/codebook.xlsx \
-  --output models/synthetic_ranker.joblib
-```
-
-模型只是候选排序器，不会生成不在 codebook 中的正式字段。
-
-### 批量运行
-
-```bash
-python cli.py run \
-  --codebook /path/to/codebook.xlsx \
-  --input /path/to/input.xlsx \
-  --output-dir outputs \
-  --config config.yaml \
-  --model models/synthetic_ranker.joblib
-```
-
-### 启动旧版 Streamlit 界面
+启动后依次选择原始 Excel、codebook 和配置文件，填写年鉴起止年月，再运行第一遍匹配与人工复核。保存“人工复核完成”文件后，在变动审核模块加载该文件；检查、导出并保存变动审核阶段结果后，再将其上传到 post_rank 审阅模块。完成 Excel 人工修改后，按最终检查步骤生成成稿。旧版 Streamlit 入口保留用于兼容：
 
 ```bash
 python cli.py review-ui
 ```
 
-Streamlit 版本保留用于兼容旧工作流。日常人工复核建议使用 PySide6，因为它支持批次暂存、上一条/下一条、候选卡片、alias 写入和变动审阅的连续流程。
+命令行的 codebook 审计和批量运行入口如下：
 
-## 输入数据要求
-
-常用字段如下：
-
-```text
-record_id, year, cityname, distname,
-w_name_o, w_name, wrank_t, wrank20, s1_sector,
-p_name, post_rank, styr, stmo, fiyr, fimo
+```bash
+python cli.py audit --codebook /path/to/codebook.xlsx --reports-dir reports/codebook_audit
+python cli.py train --codebook /path/to/codebook.xlsx --output models/synthetic_ranker.joblib
+python cli.py run --codebook /path/to/codebook.xlsx --input /path/to/input.xlsx --output-dir outputs --config config.yaml --model models/synthetic_ranker.joblib
 ```
 
-建议提供稳定的 `record_id`。如果没有，程序会根据源行和重复次序生成内部 ID。
+## 9. 输出、日志与追溯
 
-任职时间由 `styr/stmo` 到 `fiyr/fimo` 共同决定。缺少月份时，年度边界按该年的中间月份用于审阅定位；codebook 的有效期则按起始年 1 月、结束年 12 月解释。
+批处理运行目录通常包含：
 
-## Codebook 要求
+| 文件 | 内容与用途 |
+|---|---|
+| `reviewed_content.xlsx` | 输入表副本及程序生成的审核结果字段 |
+| `review_queue.xlsx` | 错误输入、字段冲突、多种可能、无法判断等人工队列 |
+| `modification_log.xlsx` | 字段级修改前后值及对应来源 |
+| `temporal_review_queue.xlsx` | 名称超出有效期或有效期无法判断的记录 |
+| `post_rank_adjustment_log.xlsx` | 部门等级变化所对应的职位等级联动建议 |
+| `debug/queries.jsonl` | 名称查询、候选与判定证据，供技术排查 |
+| `run_meta.json` | 本次运行配置和元数据 |
 
-`codebook.xlsx` 必须包含：
+部门扩充阶段文件另含处理结果、问题清单、拆分日志和汇总。post_rank 预审表逐条显示年份、部门、`post1`、当前 `wrank_t`、推导的职位类别、理论级别、原 `post_rank` 和问题类型。`source_index`、源行号或 `record_id` 应与原数据结合使用，不能把排序后的表格显示行号当作源数据行号。
 
-```text
-cityname, distname, dtype, drank,
-s1_sector, wrank, w_name, alias, notes,
-year_valid_from, month_valid_from,
-year_valid_to, month_valid_to
-```
+可追溯性来自四类证据：本批使用的 codebook 记录（标准名称、alias、地域范围、有效期及等级）；源 Excel 的行标识；程序生成的阶段文件与拆分日志；以及人工审核暂存和修改前后日志。分享或归档一次审核时，应一并保存原始输入版本、codebook 版本、程序版本、年鉴范围、阶段文件和最终审核记录。公共 GitHub 仓库不应包含研究数据、API Key、个人缓存或本地临时文件。
 
-`alias` 支持 `；`、`;`、`|`、逗号、空格和换行分隔。标准名称始终是 `w_name`，真实数据中的其他称呼只能作为 alias，不会替代标准名称。
+## 10. 输入格式与 codebook 约定
 
-四个有效期字段全部为空，表示该 codebook 记录适用于所有年份。有效期字段存在时，程序会进行时间范围检查。
-
-## DeepSeek API
-
-PySide6 页面可以选择 DeepSeek API，并填写 API Key、模型名称、API 地址和本次调用上限。
-
-API Key 只在本次运行内存中使用，不写入配置文件、日志或 Git。DeepSeek 只能在规则和排序器无法高置信决定时，对已有候选进行二次裁决；它不能生成候选白名单之外的部门名称。详细约束见 `skills/deepseek_judge/SKILL.md`。
-
-## 输出文件
-
-每次批处理会在指定输出目录生成：
+codebook 至少应提供以下字段：
 
 ```text
-reviewed_content.xlsx             输入文件副本及系统结果
-review_queue.xlsx                 错误输入、冲突、多种可能等问题
-modification_log.xlsx             字段级 before/after 日志
-temporal_review_queue.xlsx        名称有效期问题
-post_rank_adjustment_log.xlsx     职位级别联动日志
-debug/queries.jsonl               查询、候选和判定证据
-run_meta.json                     本次运行的版本与配置元数据
+cityname, distname, s1_sector, wrank, w_name, alias,
+year_valid_from, month_valid_from, year_valid_to, month_valid_to
 ```
 
-人工审核保存时，程序还会更新原始输入 Excel、`reviewed_content.xlsx`、codebook 的 alias、`data/human_feedback.csv` 和 `data/pending_review.json`。
+项目其他匹配模块可能还会使用 `dtype`、`drank`、`notes` 等字段。正式运行前应检查 codebook 的列名、标准名称唯一性、alias 冲突、地域范围和有效期边界。`alias` 支持常见分隔符；标准名始终是 `w_name`。有效期四字段为空代表不分历史段；只提供年份边界时按整年解释；提供月份边界时按具体年月解释。若有效期段有重叠或明显断档，先修正或确认 codebook，再处理数据。
 
-## 安全与可追溯性
+## 11. 重要规则与人工责任
 
-- 正式字段只能通过 codebook 候选回查，不能由模型自由生成；
-- 原始数据保存前会创建备份；
-- 原始列顺序、行顺序和非目标单元格受到导出校验保护；
-- alias 冲突不会被静默覆盖；
-- 每次人工选择都先落盘到暂存批次；
-- `post_rank` 调整保留原值、调整原因和状态；
-- 无法识别或超出范围的级别进入人工处理，不做强制猜测。
+- codebook 决定标准部门名称、适用地区、部门类别、部门级别和有效期。
+- DeepSeek（若启用）只能帮助判断 codebook 已召回的候选，不能创制正式标准名称；API Key 不应进入代码、配置提交或日志。
+- 名称组审核减少重复操作，但只有上下文一致的同名原始记录才能共用同一决定；跨地区、跨年份或跨有效期记录要检查范围。
+- 有效期扩充可能增加行数。需通过源行标识和拆分日志确认扩行的前后来源。
+- `wrank20` 是 2020 年部门级别字段。无有效期变化时按 `wrank_t` 同步；有变化时取覆盖 2020 年的 codebook 段。
+- `4post_rank.R` 词表分类属于可解释规则，不是统计概率。未命中的职位必须人工识别；边界级别无法推导时也应进入人工审核。
+- post_rank 预审只提出理论值与差异记录。最终 `post_rank` 的更改由研究者人工确认。
+- 出现字段缺失、codebook 冲突、地域不匹配、有效期重叠、等级未知或导出保护校验失败时，应停止使用该批输出并查看具体报告。
 
-## 目录结构
+## 12. 项目结构
 
 ```text
-cli.py                         命令行入口
-run_qt.py                      PySide6 启动入口
-config.yaml                    运行配置
-codebook.xlsx                  本地标准 codebook，不应提交到公共仓库
-src/engine/codebook.py         codebook 加载、时间和审计
-src/engine/candidates.py       候选召回
-src/engine/features.py         匹配特征
-src/engine/ranker.py           候选排序
-src/engine/policy.py           AUTO/HUMAN/MULTIPLE/NONE 分流
-src/engine/llm_judge.py        DeepSeek 安全仲裁
-src/engine/pipeline.py         批处理、导出和安全校验
-src/engine/qt_app.py           PySide6 人工审核界面
-src/engine/rank_adjuster.py    post_rank 等级归一化与调整
-tests/                         回归和单元测试
-resources/                     城市、后缀和冲突词表
-skills/deepseek_judge/         DeepSeek 行为约束
+run_qt.py                              PySide6 界面入口
+cli.py                                 命令行入口
+config.yaml                            程序配置
+src/engine/codebook.py                 codebook 读取、校验与适用范围
+src/engine/candidates.py               候选召回
+src/engine/ranker.py                   候选排序
+src/engine/policy.py                   自动/人工/多候选分流
+src/engine/llm_judge.py                可选的 DeepSeek 候选裁决
+src/engine/pipeline.py                 匹配、导出和内容保护校验
+src/engine/qt_app.py                   人工复核、变动审核和 post_rank 页面
+src/engine/department_expansion.py     有效期匹配、任职区间拆分和 wrank20 填充
+src/engine/post_rank_mapping.py        4post_rank.R 职位词表与理论级别推导
+resources/4post_rank.R                 原始职位词表来源
+src/engine/rank_adjuster.py            等级规范化及部门等级联动计算
+docs/workflow.svg                      高清完整流程图
+docs/CHANGE_AUDIT_AND_POST_RANK.md     变动审核与 post_rank 的实现说明
+tests/                                 自动化测试
 ```
 
-运行生成的 `outputs/`、`data/`、`cache/`、`reports/`、`*.xlsx` 和模型二进制文件默认被 `.gitignore` 排除，避免将研究数据、缓存、API 相关信息或大型中间结果提交到 GitHub。
+## 13. 验证和版本维护
 
-## 当前验证
+修改核心规则后，在项目虚拟环境中运行：
 
-本地已完成：
-
-```text
-22 个自动化测试通过
-Python 源码编译检查通过
-pip check 通过
+```bash
+python -m pytest -q
+python -m py_compile src/engine/*.py
 ```
 
-建议每次修改 codebook 或核心代码后重新运行测试，并先用小样本数据检查审核队列，再运行完整数据集。
+涉及职位词表、级别顺序、有效期解释、范围匹配或 Excel 输出的修改，应同时更新本 README、流程图和相应实现说明，并用包含已知正确答案的小样本验证正例、冲突、未知职位和边界年月。版本交付时记录代码提交、codebook 文件版本、输入文件版本和运行参数，确保之后能够复现本次审核。
