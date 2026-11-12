@@ -8,6 +8,8 @@ import json
 import ast
 import shutil
 import random
+import re
+from types import SimpleNamespace
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +28,8 @@ from .llm_judge import DeepSeekJudge, LLMJudge
 from .pipeline import Pipeline
 from .codebook import Codebook, normalize_name, split_aliases
 from .rank_adjuster import adjust_post_rank
+from .post_rank_mapping import audit_post_rank_frame
+from .department_expansion import CFG as EXPANSION_DEFAULT_CONFIG, build_card_summary, process_codebook_data, split_multi_value
 
 
 def _parse_structured(value):
@@ -409,7 +413,7 @@ class MainWindow(QMainWindow):
         brand = QLabel("WNAME\n人工审核工作台"); brand.setObjectName("brand"); brand.setTextFormat(Qt.PlainText); brand.setWordWrap(True); brand.setMinimumHeight(78); brand.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); nav_layout.addWidget(brand)
         nav_hint = QLabel("部门名称标准化与人工裁决"); nav_hint.setObjectName("navhint"); nav_layout.addWidget(nav_hint); nav_layout.addSpacing(22)
         self.nav_list = QListWidget(); self.nav_list.setObjectName("navlist"); self.nav_list.setSpacing(5)
-        for text in ["开始运行", "结果预览", "人工复核", "变动审阅", "使用说明"]:
+        for text in ["开始运行", "结果预览", "人工复核", "变动审阅", "post_rank 审阅", "使用说明"]:
             item = QListWidgetItem(text); self.nav_list.addItem(item)
         self.nav_list.setCurrentRow(0); nav_layout.addWidget(self.nav_list); nav_layout.addStretch()
         version = QLabel("本地运行 · 数据不上传\nPySide6 Desktop"); version.setObjectName("version"); nav_layout.addWidget(version)
@@ -426,6 +430,17 @@ class MainWindow(QMainWindow):
         self.model_path = QLineEdit("models/synthetic_ranker.joblib"); files_layout.addRow("排序模型", self.model_path)
         self.input = QLineEdit(); files_layout.addRow("待审核数据", self._path_row(self.input, "选择输入文件", save=False))
         setup_layout.addWidget(files_box)
+        yearbook_box = QGroupBox("年鉴时间范围（用于补充缺失任职年月）")
+        yearbook_layout = QFormLayout(yearbook_box); yearbook_layout.setHorizontalSpacing(18); yearbook_layout.setVerticalSpacing(10)
+        yearbook_row = QWidget(); yearbook_row_layout = QHBoxLayout(yearbook_row); yearbook_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.yearbook_start_year = QSpinBox(); self.yearbook_start_year.setRange(0, 3000); self.yearbook_start_year.setSpecialValueText("自动"); self.yearbook_start_year.setValue(0)
+        self.yearbook_start_month = QSpinBox(); self.yearbook_start_month.setRange(0, 12); self.yearbook_start_month.setSpecialValueText("自动"); self.yearbook_start_month.setValue(1)
+        self.yearbook_end_year = QSpinBox(); self.yearbook_end_year.setRange(0, 3000); self.yearbook_end_year.setSpecialValueText("自动"); self.yearbook_end_year.setValue(0)
+        self.yearbook_end_month = QSpinBox(); self.yearbook_end_month.setRange(0, 12); self.yearbook_end_month.setSpecialValueText("自动"); self.yearbook_end_month.setValue(12)
+        yearbook_row_layout.addWidget(QLabel("起点年")); yearbook_row_layout.addWidget(self.yearbook_start_year); yearbook_row_layout.addWidget(QLabel("月")); yearbook_row_layout.addWidget(self.yearbook_start_month)
+        yearbook_row_layout.addSpacing(12); yearbook_row_layout.addWidget(QLabel("终点年")); yearbook_row_layout.addWidget(self.yearbook_end_year); yearbook_row_layout.addWidget(QLabel("月")); yearbook_row_layout.addWidget(self.yearbook_end_month); yearbook_row_layout.addStretch()
+        yearbook_layout.addRow("年鉴范围", yearbook_row)
+        setup_layout.addWidget(yearbook_box)
         llm_box = QGroupBox("可选：二次裁决"); llm_layout = QFormLayout(llm_box); llm_layout.setHorizontalSpacing(18); llm_layout.setVerticalSpacing(10)
         self.provider = QComboBox(); self.provider.addItems(["不使用外部 LLM", "DeepSeek API"]); llm_layout.addRow("裁决方式", self.provider)
         self.api_key = QLineEdit(); self.api_key.setEchoMode(QLineEdit.Password); self.api_key.setPlaceholderText("仅本次运行使用，不会写入配置文件"); llm_layout.addRow("DeepSeek API Key", self.api_key)
@@ -440,7 +455,7 @@ class MainWindow(QMainWindow):
         self.log = QPlainTextEdit(); self.log.setReadOnly(True); self.log.setPlaceholderText("运行日志会显示在这里…"); self.log.setMaximumHeight(140); setup_layout.addWidget(self.log)
 
         help_tab = QWidget(); help_layout = QVBoxLayout(help_tab); help_layout.setContentsMargins(22, 18, 22, 18); pages.addWidget(help_tab)
-        help = QLabel("<h2>怎么开始</h2><p>1. 在“运行配置”选择待审核 Excel 和 codebook。<br>2. 如果要使用 DeepSeek，选择“DeepSeek API”并填写 Key；否则选择“不使用外部 LLM”。<br>3. 点击“开始运行”，程序完成后会自动切换到“人工复核”。<br>4. 点击“打开候选卡片复核（按名称组）”，同名记录会合并处理。</p><h2>人工复核怎么看</h2><p>候选卡片中的每次点击都会先进入“本批暂存”，不会立刻写 Excel。你可以在页面下方检查已暂存的标准名称、级别和部门类型；确认无误后点击“保存本批复核结果”，程序才会一次性更新 codebook、原始数据和 reviewed_content，并自动创建备份。已有人工复核队列仍可通过“打开已有人工复核结果”手动加载。</p><h2>职位级别联动</h2><p>当部门 wrank_t 发生变化时，程序会按统一级别序列同步调整 post_rank。“地厅级/厅级”按正厅级处理，“省部级”按正部级处理；结果沿用历史数据常用写法。无法识别或超出范围的记录不会强行修改，会保留原值并标记为待审核。</p><h2>结果文件</h2><p>运行目录会生成 reviewed_content.xlsx、review_queue.xlsx、modification_log.xlsx；如果发生职位级别联动，还会生成 post_rank_adjustment_log.xlsx。错误输入、字段冲突和多种可能会分别标明原因；alias 冲突会保留在暂存区，其他无冲突记录可以先保存。</p>")
+        help = QLabel("<h2>怎么开始</h2><p>1. 在“运行配置”选择待审核 Excel 和 codebook。<br>2. 填写年鉴起点和终点年月；缺失任职年月会按这里临时补充，导出前恢复。<br>3. 如果要使用 DeepSeek，选择“DeepSeek API”并填写 Key；否则选择“不使用外部 LLM”。<br>4. 点击“开始运行”，程序完成后会自动切换到“人工复核”。<br>5. 点击“打开候选卡片复核（按名称组）”，同名记录会合并处理。</p><h2>完整工作流程</h2><p>人工复核完成后，点击“保存本批复核结果”。程序会生成独立的“_人工复核完成.xlsx”文件，原始输入文件不变，并自动把这个阶段文件送入“变动审阅”。变动审阅会根据当前 codebook 的 cityname/distname 自动确定范围，结果是建议报告，不会自动改数据。你根据报告在 Excel 中人工修改并保存一个新文件，最后进入“post_rank 审阅”上传这个修改后的文件。上传后，程序会先把 codebook 中标为 00待处理 的部门对应行的 wrank20 统一为 00待处理，再生成 post_rank 建议。</p><h2>人工复核怎么看</h2><p>候选卡片中的每次点击都会先进入“本批暂存”，不会立刻写 Excel。你可以在页面下方检查暂存的标准名称、级别和部门类型；确认无误后再保存。alias 冲突会阻止对应记录写入，并保留在暂存区供修改。</p><h2>结果文件</h2><p>运行目录会生成 reviewed_content.xlsx、review_queue.xlsx、modification_log.xlsx；变动审阅会生成名称有效期和变动阶段问题报告；post_rank 审阅只生成建议，不会自动写回。</p>")
         help.setWordWrap(True); help_layout.addWidget(help); help_layout.addStretch()
         self.table = QTableWidget(); self._configure_table(self.table); preview_page = QWidget(); preview_layout = QVBoxLayout(preview_page); preview_layout.setContentsMargins(2, 4, 2, 2); preview_layout.addWidget(self.table); pages.insertWidget(1, preview_page)
         review_tab = QWidget(); review_layout = QVBoxLayout(review_tab); review_layout.setContentsMargins(2, 4, 2, 2); pages.insertWidget(2, review_tab)
@@ -459,16 +474,29 @@ class MainWindow(QMainWindow):
         self.delete_batch_button = QPushButton("删除选中的暂存"); self.delete_batch_button.clicked.connect(self.delete_selected_pending); batch_buttons.addWidget(self.delete_batch_button)
         self.clear_batch_button = QPushButton("清空本批暂存"); self.clear_batch_button.clicked.connect(self.clear_pending_batch); batch_buttons.addWidget(self.clear_batch_button)
         self.save_batch_button = QPushButton("保存本批复核结果"); self.save_batch_button.setObjectName("primary"); self.save_batch_button.clicked.connect(self.save_pending_batch); batch_buttons.addWidget(self.save_batch_button)
-        batch_layout.addLayout(batch_buttons); review_layout.addWidget(batch_box)
+        batch_layout.addLayout(batch_buttons)
+        self.save_progress = QProgressBar(); self.save_progress.setRange(0, 100); self.save_progress.setValue(0); self.save_progress.setFormat("尚未开始保存"); self.save_progress.setVisible(False); batch_layout.addWidget(self.save_progress)
+        review_layout.addWidget(batch_box)
 
         change_tab = QWidget(); change_layout = QVBoxLayout(change_tab); change_layout.setContentsMargins(2, 4, 2, 2); change_layout.setSpacing(10); pages.insertWidget(3, change_tab)
-        change_intro = QLabel("此页面依据 codebook 的有效期字段检查级别、类别和名称变化，并按月份节点展示拆分后的年度记录。示例中同时计算 post_rank 调整；确认人工审核并保存后，程序会把调整结果写回原数据，并生成 post_rank_adjustment_log.xlsx。")
+        change_intro = QLabel("本卡接收人工复核保存后生成的‘_人工复核完成.xlsx’；根据当前 codebook 的 cityname/distname 自动确定审阅范围，检查 w_name、s1_sector、wrank_t，并在扩充完成后补填覆盖 2020 年的 wrank20。结果只提供人工审核建议，不自动修改原始数据。")
         change_intro.setWordWrap(True); change_intro.setObjectName("hint"); change_layout.addWidget(change_intro)
-        change_bar = QHBoxLayout(); self.change_count = QLabel("请先运行或加载输入数据"); change_bar.addWidget(self.change_count); change_bar.addStretch(); self.change_refresh_button = QPushButton("刷新变动审阅"); self.change_refresh_button.setObjectName("primary"); self.change_refresh_button.clicked.connect(self._load_change_audit); change_bar.addWidget(self.change_refresh_button); change_layout.addLayout(change_bar)
-        self.change_codebook_box = QGroupBox("codebook 中包含有效期的记录"); cb_layout = QVBoxLayout(self.change_codebook_box); self.change_codebook_table = QTableWidget(); self._configure_table(self.change_codebook_table); self.change_codebook_table.setMaximumHeight(190); cb_layout.addWidget(self.change_codebook_table); change_layout.addWidget(self.change_codebook_box)
-        self.change_department_box = QGroupBox("经历过级别、类别或名称变动的部门清单"); dept_layout = QVBoxLayout(self.change_department_box); self.change_department_table = QTableWidget(); self._configure_table(self.change_department_table); self.change_department_table.setMaximumHeight(210); dept_layout.addWidget(self.change_department_table); change_layout.addWidget(self.change_department_box)
-        self.change_issue_box = QGroupBox("名称有效期与变动阶段问题"); issue_layout = QVBoxLayout(self.change_issue_box); self.change_issue_table = QTableWidget(); self._configure_table(self.change_issue_table); self.change_issue_table.setMaximumHeight(190); issue_layout.addWidget(self.change_issue_table); change_layout.addWidget(self.change_issue_box)
-        self.change_demo_box = QGroupBox("随机抽取的变动人员示例"); demo_layout = QVBoxLayout(self.change_demo_box); self.change_demo_label = QLabel("运行后将在这里展示一个发生过变动或拆分的部门和人员。"); self.change_demo_label.setWordWrap(True); demo_layout.addWidget(self.change_demo_label); self.change_demo_table = QTableWidget(); self._configure_table(self.change_demo_table); demo_layout.addWidget(self.change_demo_table); change_layout.addWidget(self.change_demo_box, 1)
+        change_bar = QHBoxLayout(); self.change_count = QLabel("请先运行，或加载‘_人工复核完成.xlsx’"); change_bar.addWidget(self.change_count); change_bar.addStretch(); self.change_stage_button = QPushButton("加载人工复核完成文件"); self.change_stage_button.clicked.connect(self._load_human_reviewed_stage); change_bar.addWidget(self.change_stage_button); self.change_refresh_button = QPushButton("刷新变动审阅"); self.change_refresh_button.setObjectName("primary"); self.change_refresh_button.clicked.connect(self._load_change_audit); change_bar.addWidget(self.change_refresh_button); self.change_export_button = QPushButton("导出扩行结果"); self.change_export_button.clicked.connect(self._export_change_expansion); change_bar.addWidget(self.change_export_button); change_layout.addLayout(change_bar)
+        # Keep the change-review card focused on the two views that are
+        # actually needed for the user's manual decision: the detailed issue
+        # list and the compact summary.  The codebook/department/demo tables
+        # remain available to the backend for report generation, but are no
+        # longer placed in the crowded main view.
+        self.change_codebook_box = QGroupBox("codebook 中包含有效期的记录"); cb_layout = QVBoxLayout(self.change_codebook_box); self.change_codebook_table = QTableWidget(); self._configure_table(self.change_codebook_table); cb_layout.addWidget(self.change_codebook_table)
+        self.change_department_box = QGroupBox("经历过级别、类别或名称变动的部门清单"); dept_layout = QVBoxLayout(self.change_department_box); self.change_department_table = QTableWidget(); self._configure_table(self.change_department_table); dept_layout.addWidget(self.change_department_table)
+        self.change_issue_box = QGroupBox("名称有效期和变动阶段问题"); issue_layout = QVBoxLayout(self.change_issue_box); self.change_issue_table = QTableWidget(); self._configure_table(self.change_issue_table); self.change_issue_table.setMinimumHeight(360); issue_layout.addWidget(self.change_issue_table); change_layout.addWidget(self.change_issue_box, 1)
+        self.change_summary_box = QGroupBox("变动审核汇总"); sum_layout = QVBoxLayout(self.change_summary_box); self.change_summary_label = QLabel("运行后显示汇总"); self.change_summary_label.setWordWrap(True); self.change_summary_label.setMinimumHeight(105); sum_layout.addWidget(self.change_summary_label); change_layout.addWidget(self.change_summary_box)
+        self.change_demo_box = QGroupBox("随机抽取的变动人员示例"); demo_layout = QVBoxLayout(self.change_demo_box); self.change_demo_label = QLabel("运行后将在这里展示一个发生过变动或拆分的部门和人员。"); self.change_demo_label.setWordWrap(True); demo_layout.addWidget(self.change_demo_label); self.change_demo_table = QTableWidget(); self._configure_table(self.change_demo_table); demo_layout.addWidget(self.change_demo_table)
+
+        post_tab = QWidget(); post_layout = QVBoxLayout(post_tab); post_layout.setContentsMargins(2,4,2,2); pages.insertWidget(4, post_tab)
+        post_layout.addWidget(QLabel("请先在变动审核中人工修改并保存 Excel，再在这里上传修改后的文件。上传后程序会先按 codebook 自动把匹配到 00待处理 部门的 wrank20 统一为 00待处理，并生成独立阶段文件；随后读取当前 wrank_t，使用 4post_rank.R 的四组职位词表识别 post1，推导理论 post_rank 并列出不一致与未知职位。post_rank 本身不会自动写回。"))
+        post_bar=QHBoxLayout(); self.post_file_label=QLabel("尚未上传变动审核完成文件"); post_bar.addWidget(self.post_file_label); self.post_upload_button=QPushButton("上传并生成 post_rank 审阅"); self.post_upload_button.setObjectName("primary"); self.post_upload_button.clicked.connect(self._load_post_rank_review); post_bar.addWidget(self.post_upload_button); post_layout.addLayout(post_bar)
+        self.post_count=QLabel("等待上传"); post_layout.addWidget(self.post_count); self.post_table=QTableWidget(); self._configure_table(self.post_table); post_layout.addWidget(self.post_table)
 
     def _configure_table(self, table: QTableWidget) -> None:
         table.setAlternatingRowColors(True); table.setSelectionBehavior(QAbstractItemView.SelectRows); table.setEditTriggers(QAbstractItemView.NoEditTriggers); table.setWordWrap(False)
@@ -532,6 +560,33 @@ class MainWindow(QMainWindow):
         end = f"{text(row.get('year_valid_to'))}-{text(row.get('month_valid_to'))}"
         return f"{start} 至 {end}"
 
+    @staticmethod
+    def _row_matches_codebook_scope(data_row: pd.Series, codebook: Codebook) -> bool:
+        """Return whether a data row belongs to any codebook city/dist scope.
+
+        Empty codebook scope cells are treated as wildcards.  This replaces the
+        former Guangzhou-only filter and is shared by change and post-rank
+        stages.
+        """
+        if not {"cityname", "distname"}.issubset(codebook.frame.columns):
+            return True
+        city = str(data_row.get("cityname", "") or "").strip()
+        dist = str(data_row.get("distname", "") or "").strip()
+        for _, code_row in codebook.frame.iterrows():
+            code_city = split_multi_value(code_row.get("cityname", ""))
+            code_dist = split_multi_value(code_row.get("distname", ""))
+            city_ok = not code_city or city in code_city
+            dist_ok = not code_dist or dist in code_dist
+            if city_ok and dist_ok:
+                return True
+        return False
+
+    def _filter_codebook_scope(self, frame: pd.DataFrame, codebook: Codebook) -> pd.DataFrame:
+        if frame.empty:
+            return frame.copy()
+        mask = frame.apply(lambda row: self._row_matches_codebook_scope(row, codebook), axis=1)
+        return frame.loc[mask].copy()
+
     def _load_change_audit(self) -> None:
         if self.source_path is None or not self.source_path.exists():
             self.change_count.setText("请先选择或运行输入数据"); return
@@ -546,6 +601,9 @@ class MainWindow(QMainWindow):
             else:
                 input_frame = pd.read_csv(self.source_path, dtype=object, usecols=lambda column: column in {"year", "cityname", "distname", "w_name", "w_name_o", "wrank20", "wrank_t", "post_rank", "p_name", "styr", "stmo", "fiyr", "fimo", "record_id"})
             cb = Codebook(Path(self.codebook.text()))
+            # Scope is determined by the current codebook, not by a hardcoded
+            # city.  Blank city/dist cells in codebook act as wildcards.
+            input_frame = self._filter_codebook_scope(input_frame, cb)
             change_rows = [row for row in cb.valid_rows() if not row.all_time_empty]
             cb_records = []
             for row in change_rows:
@@ -571,7 +629,7 @@ class MainWindow(QMainWindow):
                 department_records.append({"cityname": cityname, "distname": distname, "w_name": w_name, "变化字段": "、".join(fields), "s1_sector范围": " → ".join(sectors), "wrank_t范围": " → ".join(ranks), "有效期段数": len(items), "备注": notes_text})
             self.change_departments_frame = pd.DataFrame(department_records)
             self._fill_table(self.change_department_table, self.change_departments_frame, ["cityname", "distname", "w_name", "变化字段", "s1_sector范围", "wrank_t范围", "有效期段数", "备注"])
-            audit, transformed, demos = self._build_change_preview(input_frame, cb)
+            audit, transformed, demos = self._build_change_preview_expanded(input_frame, cb)
             self.change_audit_frame = audit; self.change_transformed_frame = transformed
             if self.result and self.result.get("output_dir") and not audit.empty:
                 temporal_rows = audit[audit["issue_type"].astype(str).isin({"w_name超出有效期", "w_name有效期无法判断"})].copy()
@@ -589,6 +647,7 @@ class MainWindow(QMainWindow):
             issue_counts = audit["issue_type"].value_counts().to_dict() if not audit.empty else {}
             self._fill_table(self.change_issue_table, audit, ["year", "p_name", "cityname", "distname", "w_name", "issue_type", "reason"])
             self.change_count.setText(f"codebook 变动记录 {len(change_rows):,} 条；检测到变动相关输入 {getattr(self, '_change_input_count', 0):,} 条；名称超出有效期 {issue_counts.get('w_name超出有效期', 0):,} 条；级别未变但 wrank 不统一 {issue_counts.get('级别没变但是wrank不统一', 0):,} 条；可演示人员 {len(demos):,} 组")
+            self.change_summary_label.setText(self._format_change_summary(audit))
             if demos:
                 sample = random.choice(demos)
                 self.change_demo_label.setText(f"示例部门：{sample['w_name']}　｜　人员：{sample['p_name']}　｜　城市/区县：{sample['cityname']} / {sample['distname']}\n处理方式：{sample['description']}")
@@ -597,6 +656,112 @@ class MainWindow(QMainWindow):
                 self.change_demo_label.setText("当前输入中没有找到可以展示的变动人员样本。"); self.change_demo_table.clearContents(); self.change_demo_table.setRowCount(0)
         except Exception as exc:
             self.change_count.setText(f"变动审阅生成失败：{exc}")
+
+    def _load_human_reviewed_stage(self) -> None:
+        """Load a saved human-review stage without rerunning the matcher."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择人工复核完成文件",
+            "",
+            "人工复核完成文件 (*.xlsx *.xlsm);;Excel (*.xlsx *.xlsm)",
+        )
+        if not path:
+            return
+        selected = Path(path)
+        self.source_path = selected
+        self.result = None
+        self.status.setText(f"已加载人工复核完成文件：{selected.name}")
+        self.log.appendPlainText(self.status.text())
+        self._load_change_audit()
+        self.nav_list.setCurrentRow(3)
+
+    @staticmethod
+    def _format_change_summary(audit: pd.DataFrame) -> str:
+        if audit is None or audit.empty: return "共发现 0 条变动审核问题。"
+        counts=audit.get("issue_type",pd.Series(dtype=object)).value_counts().to_dict()
+        lines=[f"共发现 {len(audit):,} 条：", f"名称超出有效期：{counts.get('w_name超出有效期',0):,} 条", f"唯一变动建议：{counts.get('变动建议',0):,} 条", f"级别未变但 wrank 不统一：{counts.get('级别没变但是wrank不统一',0):,} 条", "", "处理顺序：先确认 codebook 有效期，再核对历史名称，最后由人工决定修改 codebook 或原始数据。", "以上均为系统建议，没有自动写回。"]
+        return "\n".join(lines)
+
+    def _load_post_rank_review(self) -> None:
+        path,_=QFileDialog.getOpenFileName(self,"选择已完成变动审核的 Excel","","Excel (*.xlsx *.xlsm)")
+        if not path: return
+        try:
+            # Before post_rank review, apply the deterministic 2020-level
+            # cleanup requested by the user.  The uploaded file is preserved;
+            # the next-stage copy receives the wrank20 updates.
+            prepared_path, wrank20_changes = self._prepare_wrank20_stage(Path(path))
+            full_frame = pd.read_excel(prepared_path,dtype=object)
+            if not {"cityname","distname"}.issubset(full_frame.columns): raise ValueError("文件缺少 cityname 或 distname")
+            post_codebook = Codebook(Path(self.codebook.text()))
+            frame = self._filter_codebook_scope(full_frame, post_codebook)
+            temp=prepared_path; old=self.source_path; self.source_path=temp
+            logs,_=self._audit_post_rank_file(temp)
+            self.source_path=old
+            post_audit = audit_post_rank_frame(frame)
+            self.post_file_label.setText(f"原文件：{path}\n阶段文件：{prepared_path}")
+            self.post_count.setText(f"已自动统一 {wrank20_changes:,} 行 wrank20=00待处理；发现 {len(post_audit):,} 条职位级别需人工核查；另有 {len(logs):,} 条部门级别联动建议。")
+            if not post_audit.empty:
+                self._fill_table(self.post_table, post_audit, ["year", "cityname", "distname", "w_name", "post1", "wrank_t", "职位类别", "理论post_rank", "原post_rank", "issue_type"])
+            else:
+                self._fill_table(self.post_table,pd.DataFrame(),["year", "w_name", "post1", "wrank_t", "理论post_rank", "原post_rank", "issue_type"])
+        except Exception as exc: self.post_count.setText(f"post_rank 审阅失败：{exc}")
+
+    def _prepare_wrank20_stage(self, path: Path) -> tuple[Path, int]:
+        """Create a post-review stage file with codebook 00-rank cleanup.
+
+        This is deliberately independent of validity intervals: ``wrank20``
+        represents the 2020 department level.  Historical names are matched
+        through codebook aliases, with the steel-factory name transition kept
+        as an explicit compatibility rule.
+        """
+        codebook_path = Path(self.codebook.text())
+        cb = Codebook(codebook_path)
+        zero_rows = []
+        for row in cb.valid_rows():
+            rank = normalize_name(row.wrank)
+            if rank in {"00待出", "00待处理"} or "00待出" in rank:
+                variants = {normalize_name(row.w_name), *(normalize_name(alias) for alias in row.aliases)} - {""}
+                if normalize_name(row.w_name) == normalize_name("钢铁企业集团") or normalize_name("广州钢铁厂") in variants:
+                    variants.update({normalize_name("钢铁厂"), normalize_name("广州钢铁集团"), normalize_name("广州钢铁集团有限公司")})
+                zero_rows.append((row, variants))
+        if path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            raise ValueError("wrank20 自动处理目前只支持 xlsx/xlsm")
+        output = path.with_name(f"{path.stem}_00待处理完成{path.suffix}")
+        shutil.copy2(path, output)
+        book = load_workbook(output, keep_vba=path.suffix.lower() == ".xlsm")
+        sheet = book[book.sheetnames[0]]
+        headers = {str(sheet.cell(1, col).value).strip(): col for col in range(1, sheet.max_column + 1) if sheet.cell(1, col).value is not None}
+        required = ["wrank20", "w_name", "cityname", "distname"]
+        missing = [field for field in required if field not in headers]
+        if missing:
+            raise ValueError(f"文件缺少字段：{missing}")
+        w20_col, name_col = headers["wrank20"], headers["w_name"]
+        original_col = headers.get("w_name_o")
+        city_col, dist_col = headers["cityname"], headers["distname"]
+
+        def scope_values(value):
+            return {normalize_name(part) for part in re.split(r"\s*[|｜、,，;；]\s*", str(value or "")) if normalize_name(part)}
+
+        def applies(row, city, dist):
+            cities, dists = scope_values(row.cityname), scope_values(row.distname)
+            return (not cities or normalize_name(city) in cities) and (not dists or normalize_name(dist) in dists)
+
+        changed = 0
+        for excel_row in range(2, sheet.max_row + 1):
+            city, dist = sheet.cell(excel_row, city_col).value, sheet.cell(excel_row, dist_col).value
+            names = {normalize_name(sheet.cell(excel_row, name_col).value)}
+            if original_col:
+                names.add(normalize_name(sheet.cell(excel_row, original_col).value))
+            if any(applies(row, city, dist) and names & variants for row, variants in zero_rows):
+                if normalize_name(sheet.cell(excel_row, w20_col).value) != normalize_name("00待处理"):
+                    sheet.cell(excel_row, w20_col).value = "00待处理"
+                    changed += 1
+        book.save(output)
+        return output, changed
+
+    def _audit_post_rank_file(self, path: Path):
+        obj=MainWindow.__new__(MainWindow)
+        return MainWindow._apply_temporal_postprocess(obj,path,Path(self.codebook.text()))
 
     def _fill_table(self, table: QTableWidget, frame: pd.DataFrame, columns: list[str]) -> None:
         frame = frame.copy() if frame is not None else pd.DataFrame()
@@ -609,6 +774,123 @@ class MainWindow(QMainWindow):
                 table.setItem(i, j, QTableWidgetItem(str(value)))
         table.resizeColumnsToContents(); table.setSortingEnabled(True)
 
+    def _build_change_preview_expanded(self, frame: pd.DataFrame, cb: Codebook):
+        """Run the standalone department expansion engine for the change card.
+
+        The engine returns full-column processed rows, a problem queue, and a
+        split log.  The UI remains read-only: only the explicit export button
+        writes these results to a new workbook.
+        """
+        settings = {}
+        try:
+            import yaml
+            config_path = Path(self.config.text())
+            if config_path.exists():
+                raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                settings = dict(raw.get("department_expansion", {}) or {})
+        except Exception:
+            settings = {}
+        ui_start_year = self.yearbook_start_year.value() if hasattr(self, "yearbook_start_year") else 0
+        ui_start_month = self.yearbook_start_month.value() if hasattr(self, "yearbook_start_month") else 1
+        ui_end_year = self.yearbook_end_year.value() if hasattr(self, "yearbook_end_year") else 0
+        ui_end_month = self.yearbook_end_month.value() if hasattr(self, "yearbook_end_month") else 12
+        if ui_start_year > 0:
+            settings["yearbook_year_start"] = ui_start_year
+        if ui_end_year > 0:
+            settings["yearbook_year_end"] = ui_end_year
+        if ui_start_month > 0:
+            settings["yearbook_month_start"] = ui_start_month
+        if ui_end_month > 0:
+            settings["yearbook_month_end"] = ui_end_month
+        if settings.get("yearbook_year_start") and settings.get("yearbook_year_end"):
+            start_key = int(settings["yearbook_year_start"]) * 12 + int(settings.get("yearbook_month_start", 1)) - 1
+            end_key = int(settings["yearbook_year_end"]) * 12 + int(settings.get("yearbook_month_end", 12)) - 1
+            if start_key > end_key:
+                raise ValueError("年鉴起止时间无效：起点必须早于或等于终点")
+        years = pd.to_numeric(frame.get("year", pd.Series(dtype=object)), errors="coerce").dropna()
+        if len(years):
+            if settings.get("yearbook_year_start") is None:
+                settings["yearbook_year_start"] = int(years.min())
+            if settings.get("yearbook_year_end") is None:
+                settings["yearbook_year_end"] = int(years.max())
+        if settings.get("yearbook_month_start") is None:
+            settings["yearbook_month_start"] = 1
+        if settings.get("yearbook_month_end") is None:
+            settings["yearbook_month_end"] = 12
+        if settings.get("enable_backfill") is None:
+            settings["enable_backfill"] = True
+        expansion_cfg = EXPANSION_DEFAULT_CONFIG.copy()
+        expansion_cfg.update({
+            "yearbook_year_start": settings.get("yearbook_year_start"),
+            "yearbook_month_start": settings.get("yearbook_month_start", 1),
+            "yearbook_year_end": settings.get("yearbook_year_end"),
+            "yearbook_month_end": settings.get("yearbook_month_end", 12),
+            "enable_backfill": settings.get("enable_backfill", True),
+        })
+        for key in expansion_cfg:
+            if key in settings:
+                expansion_cfg[key] = settings[key]
+        result_processed, result_issues, result_split = process_codebook_data(cb.frame.copy(), frame.copy(), expansion_cfg)
+        result = SimpleNamespace(
+            processed=result_processed,
+            issues=result_issues,
+            split_log=result_split,
+            summary=build_card_summary(result_processed, result_issues, result_split, len(frame)),
+        )
+        self._last_expansion_result = result
+        audit = result.issues.copy()
+        if "audit_result" in audit.columns:
+            audit["issue_type"] = audit["audit_result"]
+            audit["reason"] = audit["audit_result"]
+        self._change_input_count = len(audit)
+        transformed = result.processed.copy()
+        demos = []
+        if "_split_flag" in transformed.columns:
+            split = transformed[transformed["_split_flag"].fillna(0).astype(str).isin({"1", "1.0"})]
+            if not split.empty:
+                group_columns = [column for column in ["p_name", "w_name", "w_name_o"] if column in split.columns]
+                for _, group in split.groupby(group_columns or [split.index], dropna=False, sort=False):
+                    sample = group.head(20).copy()
+                    display_columns = [column for column in ["year", "p_name", "w_name_o", "w_name", "s1_sector", "wrank20", "wrank_t", "post_rank", "styr", "stmo", "fiyr", "fimo", "_split_flag", "_segment_start", "_segment_end", "audit_result"] if column in sample.columns]
+                    demos.append({
+                        "w_name": str(group.iloc[0].get("w_name") or group.iloc[0].get("w_name_o") or "").strip(),
+                        "p_name": str(group.iloc[0].get("p_name") or "").strip() or "（未记录姓名）",
+                        "cityname": group.iloc[0].get("cityname", ""),
+                        "distname": group.iloc[0].get("distname", ""),
+                        "description": "来自部门扩充模块：按有效期节点生成变化前/变化后分段。",
+                        "frame": sample[display_columns],
+                    })
+                    if len(demos) >= 20:
+                        break
+        return audit, transformed, demos
+
+    def _export_change_expansion(self) -> None:
+        result = getattr(self, "_last_expansion_result", None)
+        if result is None:
+            QMessageBox.information(self, "尚未生成结果", "请先运行或刷新变动审核。")
+            return
+        default = "变化已经扩充.xlsx"
+        if self.source_path is not None:
+            default = str(self.source_path.with_name(self.source_path.stem + "_变化已经扩充.xlsx"))
+        path, _ = QFileDialog.getSaveFileName(self, "导出部门扩充结果", default, "Excel (*.xlsx)")
+        if not path:
+            return
+        target = Path(path)
+        if self.source_path is not None and target.resolve() == self.source_path.resolve():
+            QMessageBox.warning(self, "禁止覆盖输入文件", "扩行结果必须导出为新文件，不能覆盖当前输入文件。")
+            return
+        try:
+            with pd.ExcelWriter(target, engine="openpyxl") as writer:
+                result.processed.to_excel(writer, sheet_name="处理结果", index=False)
+                result.issues.to_excel(writer, sheet_name="问题清单", index=False)
+                result.split_log.to_excel(writer, sheet_name="拆分日志", index=False)
+                result.summary.to_excel(writer, sheet_name="卡片摘要", index=False)
+            QMessageBox.information(self, "导出完成", f"部门扩充结果已保存：\n{target}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+
+    # Legacy preview retained for backward compatibility with external callers;
+    # the UI now uses _build_change_preview_expanded above.
     def _build_change_preview(self, frame: pd.DataFrame, cb: Codebook):
         if "w_name" not in frame.columns and "w_name_o" not in frame.columns:
             return pd.DataFrame(), frame.copy(), []
@@ -756,14 +1038,14 @@ class MainWindow(QMainWindow):
 
     def _apply_review_scope(self, frame: pd.DataFrame) -> pd.DataFrame:
         frame = frame.copy()
-        pairs = self._scope_pairs()
-        if "cityname" not in frame.columns or "distname" not in frame.columns or not pairs:
+        try:
+            cb = Codebook(Path(self.codebook.text()))
+        except Exception:
+            cb = None
+        if cb is None or "cityname" not in frame.columns or "distname" not in frame.columns:
             frame["_scope_match"] = False
         else:
-            frame["_scope_match"] = [
-                (normalize_name(city), normalize_name(dist)) in pairs
-                for city, dist in zip(frame["cityname"], frame["distname"])
-            ]
+            frame["_scope_match"] = frame.apply(lambda row: self._row_matches_codebook_scope(row, cb), axis=1)
         return frame
 
     def open_human_review(self) -> None:
@@ -844,6 +1126,14 @@ class MainWindow(QMainWindow):
             for j, col in enumerate(columns): self.batch_table.setItem(i, j, QTableWidgetItem(str(display.get(col, ""))))
         self.batch_table.resizeColumnsToContents()
 
+    def _set_save_progress(self, value: int, message: str) -> None:
+        if not hasattr(self, "save_progress"):
+            return
+        self.save_progress.setVisible(True)
+        self.save_progress.setValue(max(0, min(100, int(value))))
+        self.save_progress.setFormat(f"{message}　{int(value)}%")
+        QApplication.processEvents()
+
     def clear_pending_batch(self) -> None:
         if not self.pending_decisions:
             return
@@ -872,7 +1162,7 @@ class MainWindow(QMainWindow):
         # Keep an audit trail beside the adjusted value.  The original
         # post_rank is copied only once, so rerunning a batch never compounds
         # the same adjustment.
-        if "post_rank" in headers:
+        if apply_post_rank and "post_rank" in headers:
             for field in ("post_rank_original", "post_rank_adjustment_reason", "post_rank_adjustment_status"):
                 if field not in headers:
                     headers[field] = sheet.max_column + 1; sheet.cell(1, headers[field]).value = field
@@ -913,17 +1203,17 @@ class MainWindow(QMainWindow):
         return adjustment_logs
 
     def _apply_temporal_postprocess(self, path: Path, codebook_path: Path) -> tuple[list[dict], list[dict]]:
-        """Apply validity-bounded coding, then adjust post_rank once.
+        """Audit validity and rank changes without mutating the workbook.
 
-        This is deliberately a second stage after human decisions.  A legacy
-        department name that is outside its codebook validity interval is
-        reported for manual handling and is never silently renamed.
+        Temporal changes and post_rank changes are proposals only.  They are
+        written to the review logs/queues and must be approved by the human
+        reviewer before a separate, explicit write operation is introduced.
         """
         book = load_workbook(path)
         sheet = book[book.sheetnames[0]]
         headers = {str(sheet.cell(1, c).value): c for c in range(1, sheet.max_column + 1) if sheet.cell(1, c).value}
         if "w_name" not in headers:
-            book.save(path); return [], []
+            return [], []
         cb = Codebook(codebook_path)
         scoped: dict[tuple[str, str, str], list] = {}
         for item in cb.valid_rows():
@@ -935,62 +1225,57 @@ class MainWindow(QMainWindow):
                     for name in names:
                         scoped.setdefault((city, dist, name), []).append(item)
 
-        for field in ("post_rank_original", "post_rank_adjustment_reason", "post_rank_adjustment_status"):
-            if "post_rank" in headers and field not in headers:
-                headers[field] = sheet.max_column + 1
-                sheet.cell(1, headers[field]).value = field
         adjustment_logs: list[dict] = []
         issues: list[dict] = []
-        original_wrank: dict[int, object] = {}
 
         for excel_row in range(2, sheet.max_row + 1):
             city = normalize_name(sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "")
             dist = normalize_name(sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "")
+            scope_row = pd.Series({"cityname": city, "distname": dist})
+            if not self._row_matches_codebook_scope(scope_row, cb):
+                continue
             name_value = sheet.cell(excel_row, headers["w_name"]).value
             name = normalize_name(name_value)
             old_wrank = sheet.cell(excel_row, headers["wrank_t"]).value if "wrank_t" in headers else ""
-            original_wrank[excel_row] = old_wrank
+            proposed_w_name = name_value
+            proposed_sector = sheet.cell(excel_row, headers["s1_sector"]).value if "s1_sector" in headers else ""
+            proposed_wrank = old_wrank
             matches = scoped.get((city, dist, name), []) if city and dist and name else []
             changed = [item for item in matches if not item.all_time_empty]
             if changed:
                 year = self._as_int(sheet.cell(excel_row, headers["year"]).value) if "year" in headers else None
                 month = self._as_int(sheet.cell(excel_row, headers["stmo"]).value) if "stmo" in headers else 6
                 if year is None:
-                    issues.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "cityname": sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "", "distname": sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "", "w_name": name_value, "year": "", "issue_type": "w_name有效期无法判断", "reason": "缺少 year，无法判断部门名称是否处于有效期内"})
+                    issues.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "cityname": sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "", "distname": sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "", "w_name": name_value, "year": "", "issue_type": "w_name有效期无法判断", "reason": "缺少 year，无法判断部门名称是否处于有效期内", "action": "人工审阅后决定是否修改"})
                 else:
                     key = self._month_key(year, month or 6)
                     active = [item for item in changed if item.start_month <= key <= item.end_month]
                     if not active:
                         periods = "；".join(self._display_period({"year_valid_from": item.year_valid_from, "month_valid_from": item.month_valid_from, "year_valid_to": item.year_valid_to, "month_valid_to": item.month_valid_to}) for item in changed)
-                        issues.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "cityname": sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "", "distname": sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "", "w_name": name_value, "year": year, "issue_type": "w_name超出有效期", "reason": f"该名称仅在以下有效期内使用：{periods}"})
+                        issues.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "cityname": sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "", "distname": sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "", "w_name": name_value, "year": year, "issue_type": "w_name超出有效期", "reason": f"该名称仅在以下有效期内使用：{periods}", "action": "人工审阅后决定是否修改"})
                     else:
                         signatures = {(item.w_name, item.s1_sector, item.wrank) for item in active}
                         if len(signatures) > 1:
-                            issues.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "cityname": sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "", "distname": sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "", "w_name": name_value, "year": year, "issue_type": "多种可能", "reason": "同一名称和年份对应多个不同的 codebook 编码"})
+                            issues.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "cityname": sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "", "distname": sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "", "w_name": name_value, "year": year, "issue_type": "多种可能", "reason": "同一名称和年份对应多个不同的 codebook 编码", "action": "人工审阅后决定是否修改"})
                         else:
                             selected = active[0]
-                            if normalize_name(str(name_value or "")) != normalize_name(selected.w_name):
-                                sheet.cell(excel_row, headers["w_name"]).value = selected.w_name
-                            if "s1_sector" in headers:
-                                sheet.cell(excel_row, headers["s1_sector"]).value = selected.s1_sector
-                            if "wrank_t" in headers:
-                                sheet.cell(excel_row, headers["wrank_t"]).value = selected.wrank
+                            proposed_w_name = selected.w_name
+                            proposed_sector = selected.s1_sector
+                            proposed_wrank = selected.wrank
+                            if (normalize_name(str(name_value or "")) != normalize_name(selected.w_name)
+                                    or str(proposed_sector or "") != str(sheet.cell(excel_row, headers["s1_sector"]).value if "s1_sector" in headers else "")
+                                    or str(proposed_wrank or "") != str(old_wrank or "")):
+                                issues.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "cityname": sheet.cell(excel_row, headers.get("cityname", 0)).value if headers.get("cityname") else "", "distname": sheet.cell(excel_row, headers.get("distname", 0)).value if headers.get("distname") else "", "w_name": name_value, "year": year, "issue_type": "变动建议", "reason": "codebook 有唯一有效记录，但不会自动写回", "proposed_w_name": proposed_w_name, "proposed_s1_sector": proposed_sector, "proposed_wrank_t": proposed_wrank, "action": "人工审阅后决定是否修改"})
 
             if "post_rank" not in headers:
                 continue
-            final_wrank = sheet.cell(excel_row, headers["wrank_t"]).value if "wrank_t" in headers else ""
-            baseline_wrank = sheet.cell(excel_row, headers["wrank20"]).value if "wrank20" in headers and sheet.cell(excel_row, headers["wrank20"]).value not in (None, "") else original_wrank[excel_row]
-            previous_post = sheet.cell(excel_row, headers["post_rank_original"]).value if sheet.cell(excel_row, headers["post_rank_original"]).value not in (None, "") else sheet.cell(excel_row, headers["post_rank"]).value
+            final_wrank = proposed_wrank
+            baseline_wrank = sheet.cell(excel_row, headers["wrank20"]).value if "wrank20" in headers and sheet.cell(excel_row, headers["wrank20"]).value not in (None, "") else old_wrank
+            previous_post = sheet.cell(excel_row, headers["post_rank"]).value
             adjustment = adjust_post_rank(previous_post, baseline_wrank, final_wrank)
             if adjustment.delta:
-                if not sheet.cell(excel_row, headers["post_rank_original"]).value:
-                    sheet.cell(excel_row, headers["post_rank_original"]).value = previous_post
-                sheet.cell(excel_row, headers["post_rank_adjustment_reason"]).value = adjustment.reason
-                sheet.cell(excel_row, headers["post_rank_adjustment_status"]).value = adjustment.status
-                if adjustment.status == "adjusted":
-                    sheet.cell(excel_row, headers["post_rank"]).value = adjustment.adjusted
                 adjustment_logs.append({"source_row": excel_row, "record_id": sheet.cell(excel_row, headers["record_id"]).value if "record_id" in headers else "", "p_name": sheet.cell(excel_row, headers["p_name"]).value if "p_name" in headers else "", "w_name": sheet.cell(excel_row, headers["w_name"]).value, "old_wrank_t": baseline_wrank, "new_wrank_t": final_wrank, "post_rank_original": previous_post, "post_rank_adjusted": adjustment.adjusted, "delta": adjustment.delta, "status": adjustment.status, "reason": adjustment.reason})
-        book.save(path)
+        # Audit-only stage: deliberately do not save the workbook.
         return adjustment_logs, issues
 
     def save_pending_batch(self) -> None:
@@ -1006,21 +1291,27 @@ class MainWindow(QMainWindow):
             return
         decisions = list(self.pending_decisions)
         all_decisions = list(decisions)
+        self.save_batch_button.setEnabled(False)
+        self._set_save_progress(0, "准备保存")
         try:
             # Validate all aliases and manual standards before touching either file.
+            self._set_save_progress(5, "读取 codebook")
             cb = Codebook(codebook_path)
             by_entity = {row.entity_id: row for row in cb.rows}
-            scope_pairs = self._scope_pairs()
+            # Alias ownership is department-level, not validity-segment-level.
+            # The same logical department may have several codebook rows for
+            # different periods, and those rows are allowed to share aliases.
             aliases_in_batch: dict[str, str] = {}
             manual_norms: set[tuple[str, str]] = set()
             blocked_aliases: dict[tuple[str, ...], str] = {}
-            for decision in decisions:
+            total_decisions = max(1, len(decisions))
+            for decision_index, decision in enumerate(decisions, start=1):
                 decision_key = self._pending_key(decision)
                 raw = str(decision.get("raw_name", "")).strip(); raw_norm = normalize_name(raw)
                 entity_id = str(decision.get("entity_id", "") or "")
                 values = decision.get("values", {})
-                pair = (normalize_name(decision.get("cityname", "")), normalize_name(decision.get("distname", "")))
-                if pair not in scope_pairs:
+                decision_scope = pd.Series({"cityname": decision.get("cityname", ""), "distname": decision.get("distname", "")})
+                if not self._row_matches_codebook_scope(decision_scope, cb):
                     raise ValueError(
                         f"暂存记录超出审核范围：cityname={decision.get('cityname', '') or '空'}、"
                         f"distname={decision.get('distname', '') or '空'} 不在当前 codebook 的精确范围内。"
@@ -1041,13 +1332,13 @@ class MainWindow(QMainWindow):
                 if entity_id and raw_norm:
                     selected = by_entity.get(entity_id)
                     if selected and raw_norm != selected.norm_w_name:
-                        if raw_norm in aliases_in_batch and aliases_in_batch[raw_norm] != entity_id:
+                        if raw_norm in aliases_in_batch and aliases_in_batch[raw_norm] != selected.dept_key:
                             blocked_aliases[decision_key] = f"alias 冲突：‘{raw}’ 在本批被归入多个部门"
                             continue
-                        aliases_in_batch[raw_norm] = entity_id
+                        aliases_in_batch[raw_norm] = selected.dept_key
                         selected_cities = {normalize_name(x) for x in cb.split_values(selected.cityname)}
                         for other in cb.rows:
-                            if other.entity_id == entity_id: continue
+                            if other.dept_key == selected.dept_key: continue
                             other_cities = {normalize_name(x) for x in cb.split_values(other.cityname)}
                             if (not selected_cities or not other_cities or selected_cities & other_cities) and (raw_norm == other.norm_w_name or raw_norm in {normalize_name(a) for a in other.aliases}):
                                 blocked_aliases[decision_key] = (
@@ -1059,6 +1350,8 @@ class MainWindow(QMainWindow):
                                 break
                         if decision_key in blocked_aliases:
                             continue
+                if decision_index == total_decisions or decision_index % max(1, total_decisions // 10) == 0:
+                    self._set_save_progress(5 + int(decision_index / total_decisions * 20), "检查 alias 冲突")
             if blocked_aliases:
                 decisions = [decision for decision in decisions if self._pending_key(decision) not in blocked_aliases]
                 self.pending_decisions = all_decisions
@@ -1069,15 +1362,20 @@ class MainWindow(QMainWindow):
                     return
                 QMessageBox.warning(self, "部分记录存在 alias 冲突", f"将跳过 {len(blocked_aliases)} 条冲突记录，先保存其余 {len(decisions)} 条。冲突记录仍保留在暂存文件中，可稍后编辑：\n{messages}")
             answer = QMessageBox.question(self, "保存本批复核结果", f"将一次性写入 {len(decisions)} 个名称组，并更新原始 Excel 与 codebook。已自动创建备份，确定保存吗？")
-            if answer != QMessageBox.StandardButton.Yes: return
-            self._backup_once(self.source_path); self._backup_once(codebook_path)
+            if answer != QMessageBox.StandardButton.Yes:
+                self._set_save_progress(0, "已取消保存")
+                return
+            self._set_save_progress(30, "创建阶段文件")
+            reviewed_output = self.source_path.with_name(self.source_path.stem + "_人工复核完成" + self.source_path.suffix)
+            shutil.copy2(self.source_path, reviewed_output)
+            self._backup_once(reviewed_output); self._backup_once(codebook_path)
             book = load_workbook(codebook_path); sheet = book[book.sheetnames[0]]
             headers = {str(sheet.cell(1, c).value): c for c in range(1, sheet.max_column + 1) if sheet.cell(1, c).value}
             alias_col = headers.get("alias")
             if alias_col is None: raise ValueError("codebook 缺少 alias 列")
-            entity_rows: dict[str, list[int]] = {}
+            department_rows: dict[str, list[int]] = {}
             for row in cb.rows:
-                entity_rows.setdefault(row.entity_id, []).append(row.source_row)
+                department_rows.setdefault(row.dept_key, []).append(row.source_row)
             for decision in decisions:
                 values = decision.get("values", {}); entity_id = str(decision.get("entity_id", "") or "")
                 if decision.get("manual_new"):
@@ -1089,18 +1387,21 @@ class MainWindow(QMainWindow):
                     for field in ["year_valid_from", "month_valid_from", "year_valid_to", "month_valid_to"]: new_values[field] = ""
                     for field, value in new_values.items(): sheet.cell(target, headers[field]).value = value
                 elif entity_id and str(decision.get("raw_name", "")).strip() and normalize_name(str(decision.get("raw_name", ""))) != normalize_name(str(values.get("w_name", ""))):
-                    targets = entity_rows.get(entity_id, [])
+                    selected = by_entity.get(entity_id)
+                    targets = department_rows.get(selected.dept_key, []) if selected else []
                     raw = str(decision.get("raw_name", "")).strip()
                     for target in targets:
                         existing = split_aliases(sheet.cell(target, alias_col).value)
                         if normalize_name(raw) not in {normalize_name(a) for a in existing}:
                             sheet.cell(target, alias_col).value = "；".join(existing + [raw])
             book.save(codebook_path)
+            self._set_save_progress(45, "已更新 codebook")
             # Stage 1: write human decisions only.  Temporal validity and
             # post_rank are intentionally applied afterwards as separate
             # deterministic stages.
-            self._apply_source_updates(self.source_path, decisions, apply_post_rank=False)
-            post_rank_logs, temporal_issues = self._apply_temporal_postprocess(self.source_path, codebook_path)
+            self._apply_source_updates(reviewed_output, decisions, apply_post_rank=False)
+            self._set_save_progress(60, "已生成人工复核完成文件")
+            post_rank_logs, temporal_issues = self._apply_temporal_postprocess(reviewed_output, codebook_path)
             if self.result and self.result.get("reviewed_content"):
                 reviewed = Path(self.result["reviewed_content"])
                 if reviewed.exists() and reviewed.resolve() != self.source_path.resolve():
@@ -1108,6 +1409,7 @@ class MainWindow(QMainWindow):
                     reviewed_logs, reviewed_issues = self._apply_temporal_postprocess(reviewed, codebook_path)
                     post_rank_logs = reviewed_logs or post_rank_logs
                     temporal_issues = reviewed_issues or temporal_issues
+            self._set_save_progress(80, "已完成变动审阅报告（未写回）")
             if self.result and self.result.get("output_dir") and post_rank_logs:
                 log_path = Path(self.result["output_dir"]) / "post_rank_adjustment_log.xlsx"
                 pd.DataFrame(post_rank_logs).to_excel(log_path, index=False)
@@ -1155,9 +1457,20 @@ class MainWindow(QMainWindow):
                     human_log = human_log.reindex(columns=old_log.columns, fill_value="")
                     pd.concat([old_log, human_log], ignore_index=True).to_excel(modification_path, index=False)
             self.pending_decisions = [decision for decision in all_decisions if self._pending_key(decision) in blocked_aliases]
-            self._persist_pending_batch(); self._refresh_batch_view(); QMessageBox.information(self, "保存完成", "可保存的本批审核已写入 codebook、原始数据和 reviewed_content；仍有 alias 冲突的记录保留在暂存区，方便继续修改。")
+            self._persist_pending_batch(); self._refresh_batch_view(); self._set_save_progress(100, "保存完成（变动待审）"); QMessageBox.information(self, "保存完成", f"人工复核完成文件已生成：\n{reviewed_output}\n\n原始输入文件保持不变。级别、类别、名称有效期及 post_rank 仅生成审核报告，需人工确认后再处理。")
+            # The next stage must read the human-reviewed stage file, not the
+            # untouched original input.  This makes the workflow continuous:
+            # human review -> saved stage file -> change audit.
+            self.source_path = reviewed_output
+            self.status.setText(f"人工复核已保存：{reviewed_output.name}；现在可进入‘变动审阅’。")
+            self.log.appendPlainText(self.status.text())
+            self._load_change_audit()
+            self.nav_list.setCurrentRow(3)
         except Exception as exc:
+            self._set_save_progress(0, "保存失败")
             QMessageBox.critical(self, "批量保存失败", str(exc))
+        finally:
+            self.save_batch_button.setEnabled(True)
 
     def load_existing_review(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "打开人工复核队列", "", "审核队列 (*.xlsx *.jsonl);;All files (*)")
