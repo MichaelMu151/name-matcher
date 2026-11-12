@@ -7,5 +7,7 @@ from .pipeline import Pipeline
 from .schemas import DecisionRecord, InputRecord, LLMResponse
 from .llm_judge import DeepSeekJudge, JudgeError, LLMJudge
 from .rank_adjuster import RankAdjustment, adjust_post_rank, canonical_rank
+from .post_rank_mapping import audit_post_rank_frame, classify_post_title, expected_post_rank
+from .department_expansion import build_card_summary, process_codebook_data, process_files
 
-__all__ = ["Codebook", "CodebookAudit", "CodebookError", "Candidate", "generate_candidates", "NormalizedName", "normalize_name", "Pipeline", "DecisionRecord", "InputRecord", "LLMResponse", "DeepSeekJudge", "JudgeError", "LLMJudge", "RankAdjustment", "adjust_post_rank", "canonical_rank"]
+__all__ = ["Codebook", "CodebookAudit", "CodebookError", "Candidate", "generate_candidates", "NormalizedName", "normalize_name", "Pipeline", "DecisionRecord", "InputRecord", "LLMResponse", "DeepSeekJudge", "JudgeError", "LLMJudge", "RankAdjustment", "adjust_post_rank", "canonical_rank", "audit_post_rank_frame", "classify_post_title", "expected_post_rank", "build_card_summary", "process_codebook_data", "process_files"]
