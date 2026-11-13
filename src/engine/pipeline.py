@@ -296,6 +296,32 @@ class Pipeline:
         pd.DataFrame(logs).to_excel(log_path, index=False)
         (output_dir / "debug").mkdir(exist_ok=True)
         debug_frame = pd.DataFrame(debug_rows)
+        # Persist the two decisions needed by the review UI.  The UI must not
+        # rescan the codebook every time the review page is opened.
+        scope_pairs = set()
+        wildcard_scope = []
+        for code_row in self.codebook.valid_rows():
+            cities = self.codebook.split_values(code_row.cityname)
+            dists = self.codebook.split_values(code_row.distname)
+            if not cities or not dists:
+                wildcard_scope.append((set(normalize_name(city) for city in cities), set(normalize_name(dist) for dist in dists)))
+            else:
+                scope_pairs.update((normalize_name(city), normalize_name(dist)) for city in cities for dist in dists)
+        if not debug_frame.empty:
+            debug_frame["codebook_version"] = _version(self.codebook_path)
+            debug_frame["model_version"] = str(self.ranker.version)
+            debug_frame["pipeline_stage"] = "initial_matching"
+            debug_frame["scope_match"] = [
+                ((normalize_name(row.get("cityname", "")), normalize_name(row.get("distname", ""))) in scope_pairs)
+                or any((not cities or normalize_name(row.get("cityname", "")) in cities) and (not dists or normalize_name(row.get("distname", "")) in dists) for cities, dists in wildcard_scope)
+                for _, row in debug_frame.iterrows()
+            ]
+            group_fields = ["raw_name", "cityname", "distname", "existing_w_name", "existing_wrank_t", "existing_s1_sector", "issue_type", "issue_fields", "candidate_ids"]
+            debug_frame["review_group_key"] = debug_frame.apply(
+                lambda row: json.dumps([str(row.get(field, "") or "") for field in group_fields], ensure_ascii=False, sort_keys=True, default=str),
+                axis=1,
+            )
+            debug_frame["review_group_count"] = debug_frame.groupby("review_group_key")["review_group_key"].transform("size")
         debug_frame.to_json(output_dir / "debug" / "queries.jsonl", orient="records", lines=True, force_ascii=False)
         debug_frame[debug_frame["issue_type"].astype(str).str.strip() != ""].to_excel(output_dir / "review_queue.xlsx", index=False)
         query_cache.close()
@@ -398,105 +424,72 @@ class Pipeline:
         # the user's original non-target columns.
         generated_fields = {"post_rank", "post_rank_original", "post_rank_adjustment_reason", "post_rank_adjustment_status"}
 
-        # For Excel inputs compare the workbook cells directly.  A pandas
-        # round-trip can coerce an integer-looking year to float or convert a
-        # date serial, which would create a false safety failure even though
-        # the copied workbook cell was untouched.
+        # For Excel inputs compare semantic cell values with openpyxl.  The
+        # previous XML-level comparison was too strict: Excel formulas carry
+        # cached results which openpyxl may drop on save, and shared strings,
+        # blank cells, and formula storage forms can legitimately change
+        # without changing the user's data.  Formula cells are compared by
+        # formula text only; cached results are deliberately ignored.
         if input_path.suffix.lower() == ".xlsx" and output_path.suffix.lower() == ".xlsx":
-            def column_number(cell_ref: str) -> int:
-                letters = "".join(character for character in cell_ref.split("$")[0] if character.isalpha())
-                number = 0
-                for character in letters.upper():
-                    number = number * 26 + ord(character) - 64
-                return number
-
-            def xml_value(cell: ET.Element, shared_strings: list[str]) -> tuple[str, str]:
-                cell_type = cell.attrib.get("t", "")
-                if cell_type == "inlineStr":
-                    value = "".join(node.text or "" for node in cell.iter() if node.tag.rsplit("}", 1)[-1] == "t")
-                    return ("none", "") if value == "" else ("str", value)
-                value_node = next((node for node in cell if node.tag.rsplit("}", 1)[-1] == "v"), None)
-                value = "" if value_node is None or value_node.text is None else value_node.text
-                if cell_type == "s":
+            def semantic(value: Any, cell: Any) -> tuple[str, str]:
+                if getattr(cell, "data_type", "") == "f" or (isinstance(value, str) and value.startswith("=")):
+                    return ("formula", str(value).strip())
+                if value is None:
+                    return ("none", "")
+                try:
+                    if pd.isna(value):
+                        return ("none", "")
+                except (TypeError, ValueError):
+                    pass
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
                     try:
-                        return ("str", shared_strings[int(value)])
-                    except (ValueError, IndexError):
-                        return ("str", value)
-                if cell_type == "b":
-                    return ("bool", "1" if value == "1" else "0")
-                if cell_type == "str":
-                    return ("none", "") if value == "" else ("str", value)
-                if value:
-                    try:
-                        numeric = float(value)
-                        if numeric.is_integer():
-                            value = str(int(numeric))
-                    except ValueError:
+                        number = float(value)
+                        return ("number", str(int(number)) if number.is_integer() else format(number, ".15g"))
+                    except (TypeError, ValueError):
                         pass
-                formula = next((node for node in cell if node.tag.rsplit("}", 1)[-1] == "f"), None)
-                if formula is not None:
-                    # openpyxl can expand Excel shared formulas into ordinary
-                    # formulas when saving a copied workbook. Both forms are
-                    # still formula cells; cached values and XML storage form
-                    # are not reliable evidence that a non-target cell changed.
-                    return ("formula", "")
-                return ("none", "") if value == "" else ("number", value)
+                if isinstance(value, (date, datetime)):
+                    return ("date", value.isoformat())
+                text = str(value)
+                return ("none", "") if text == "" else ("str", text)
 
-            def extract(path: Path) -> tuple[list[str], int, dict[str, tuple[str, str]]]:
-                with zipfile.ZipFile(path) as archive:
-                    shared: list[str] = []
-                    if "xl/sharedStrings.xml" in archive.namelist():
-                        root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-                        for item in root:
-                            if item.tag.rsplit("}", 1)[-1] == "si":
-                                shared.append("".join(node.text or "" for node in item.iter() if node.tag.rsplit("}", 1)[-1] == "t"))
-                    sheet_name = sorted(name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))[0]
-                    headers: list[str] = []
-                    cells: dict[str, tuple[str, str]] = {}
-                    max_row = 0
-                    with archive.open(sheet_name) as stream:
-                        for _, row in ET.iterparse(stream, events=("end",)):
-                            if row.tag.rsplit("}", 1)[-1] != "row":
-                                continue
-                            row_number = int(row.attrib.get("r", "0"))
-                            max_row = max(max_row, row_number)
-                            for cell in row:
-                                if cell.tag.rsplit("}", 1)[-1] != "c" or "r" not in cell.attrib:
-                                    continue
-                                reference = cell.attrib["r"]
-                                value = xml_value(cell, shared)
-                                if row_number == 1:
-                                    while len(headers) < column_number(reference):
-                                        headers.append("")
-                                    headers[column_number(reference) - 1] = value[1]
-                                cells[reference] = value
-                            row.clear()
-                    return headers, max_row, cells
-
-            source_headers, source_rows, source_cells = extract(input_path)
-            output_headers, output_rows, output_cells = extract(output_path)
+            try:
+                source_book = load_workbook(input_path, data_only=False, read_only=True)
+                output_book = load_workbook(output_path, data_only=False, read_only=True)
+            except (ET.ParseError, zipfile.BadZipFile, OSError) as exc:
+                raise ValueError(
+                    "导出安全校验无法读取 Excel 内部结构。文件可能含有非法 XML 字符或已损坏；"
+                    "请用 Excel/WPS 另存为新的 .xlsx 后重新上传。原文件不会被程序覆盖。"
+                ) from exc
+            source_sheet = source_book[source_book.sheetnames[0]]
+            output_sheet = output_book[output_book.sheetnames[0]]
+            source_iter = source_sheet.iter_rows()
+            output_iter = output_sheet.iter_rows()
+            try:
+                source_header_cells = next(source_iter)
+                output_header_cells = next(output_iter)
+            except StopIteration as exc:
+                raise ValueError("导出安全校验失败：Excel 缺少表头") from exc
+            source_headers = [cell.value for cell in source_header_cells]
+            output_headers = [cell.value for cell in output_header_cells]
             source_preserved_headers = [header for header in source_headers if header not in target_fields and header not in generated_fields]
             output_preserved_headers = [header for header in output_headers if header not in target_fields and header not in generated_fields]
             if source_preserved_headers != output_preserved_headers:
                 raise ValueError("导出安全校验失败：非目标列集合或顺序发生变化")
-            if source_rows != output_rows:
+            if source_sheet.max_row != output_sheet.max_row:
                 raise ValueError("导出安全校验失败：行数发生变化")
-            source_preserved = {
-                reference: value
-                for reference, value in source_cells.items()
-                if column_number(reference) <= len(source_headers) and source_headers[column_number(reference) - 1] not in target_fields and source_headers[column_number(reference) - 1] not in generated_fields
-            }
-            output_preserved = {
-                reference: value
-                for reference, value in output_cells.items()
-                if column_number(reference) <= len(output_headers) and output_headers[column_number(reference) - 1] not in target_fields and output_headers[column_number(reference) - 1] not in generated_fields
-            }
-            for reference in sorted(set(source_preserved) | set(output_preserved)):
-                if source_preserved.get(reference, ("none", "")) != output_preserved.get(reference, ("none", "")):
-                    header = source_headers[column_number(reference) - 1] if column_number(reference) <= len(source_headers) else reference.rstrip("0123456789")
-                    display_header = header or f"Unnamed: {column_number(reference) - 1}"
-                    row_number = "".join(character for character in reference if character.isdigit())
-                    raise ValueError(f"导出安全校验失败：{display_header}!{row_number} 被修改")
+            preserved_columns = [column for column, header in enumerate(source_headers, start=1) if header not in target_fields and header not in generated_fields]
+            for row_number, (left_row, right_row) in enumerate(zip(source_iter, output_iter), start=2):
+                for column in preserved_columns:
+                    left_cell = left_row[column - 1]
+                    right_cell = right_row[column - 1]
+                    left = semantic(left_cell.value, left_cell)
+                    right = semantic(right_cell.value, right_cell)
+                    if left != right:
+                        header = source_headers[column - 1] or f"Unnamed: {column - 1}"
+                        raise ValueError(
+                            f"导出安全校验失败：{header}!{row_number} 被修改；"
+                            f"原值={left[1]!r}，导出值={right[1]!r}"
+                        )
             return
 
         def read(path: Path) -> pd.DataFrame:
