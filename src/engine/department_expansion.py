@@ -215,6 +215,31 @@ def get_segments_for_row(row, code_sub, cfg=CFG):
     return out
 
 
+def build_scope_segment_cache(code_sub, data_sub, cfg=CFG):
+    """Cache scope matches for one normalized department group.
+
+    A department group usually contains many annual/person rows sharing the
+    same city/dist pair.  The old implementation rescanned ``code_sub`` for
+    every row.  This cache preserves the exact row_in_scope semantics while
+    doing that work once per distinct geographic pair.
+    """
+    cache = {}
+    if code_sub is None or len(code_sub) == 0:
+        return cache
+    scope_cols = [cfg["data_city"], cfg["data_dist"]]
+    available = [column for column in scope_cols if column in data_sub.columns]
+    if available:
+        pairs = data_sub[available].drop_duplicates().to_dict("records")
+    else:
+        pairs = [{}]
+    for values in pairs:
+        city = str(values.get(cfg["data_city"], "") or "").strip()
+        dist = str(values.get(cfg["data_dist"], "") or "").strip()
+        probe = pd.Series(values)
+        cache[(city, dist)] = [cr for _, cr in code_sub.iterrows() if row_in_scope(probe, cr, cfg)]
+    return cache
+
+
 def fill_from_code(row, cr, cfg=CFG):
     out = row.copy()
     out[cfg["data_name"]] = cr[cfg["code_name"]]
@@ -339,11 +364,22 @@ def fill_wrank20_from_periods(data, codebook, cfg=CFG):
     aliases = build_alias_map(codebook, cfg)
     groups = {key: group for key, group in codebook.groupby("_name_key", dropna=False)}
     output = data.copy()
+    selected_cache = {}
     for index, row in output.iterrows():
         key = norm_name(row.get(cfg["data_name"]))
         if key not in groups:
             key = aliases.get(norm_name(row.get(cfg["data_name_orig"])), key)
         if key not in groups:
+            continue
+        scope_key = (
+            key,
+            str(row.get(cfg["data_city"], "") or "").strip(),
+            str(row.get(cfg["data_dist"], "") or "").strip(),
+        )
+        if scope_key in selected_cache:
+            selected = selected_cache[scope_key]
+            if selected is not None and not is_blank(selected.get(cfg["code_wrank"])):
+                output.at[index, cfg["data_wrank20"]] = selected.get(cfg["code_wrank"])
             continue
         candidates = []
         for _, code_row in groups[key].iterrows():
@@ -356,6 +392,7 @@ def fill_wrank20_from_periods(data, codebook, cfg=CFG):
             if year_to is not None and target_year > year_to:
                 continue
             candidates.append(code_row)
+        selected = None
         if candidates:
             selected = max(
                 candidates,
@@ -364,6 +401,8 @@ def fill_wrank20_from_periods(data, codebook, cfg=CFG):
                     item.get(cfg["code_month_from"]),
                 ) if _period_key(item.get(cfg["code_year_from"]), item.get(cfg["code_month_from"])) is not None else -10**9,
             )
+        selected_cache[scope_key] = selected
+        if selected is not None:
             rank = selected.get(cfg["code_wrank"])
             if not is_blank(rank):
                 output.at[index, cfg["data_wrank20"]] = rank
@@ -429,6 +468,13 @@ def process_codebook_data(codebook, data, cfg=CFG):
             continue
 
         code_sub = code_groups[name_key]
+        scope_cache = build_scope_segment_cache(code_sub, sub, cfg)
+
+        def matched_segments(row):
+            city = str(row.get(cfg["data_city"], "") or "").strip()
+            dist = str(row.get(cfg["data_dist"], "") or "").strip()
+            return scope_cache.get((city, dist), [])
+
         valid_rows = code_sub[code_sub["_has_period"]].copy()
 
         # =====================================================
@@ -436,7 +482,7 @@ def process_codebook_data(codebook, data, cfg=CFG):
         # =====================================================
         if valid_rows.empty:
             for _, r in sub.iterrows():
-                matched = get_segments_for_row(r, code_sub, cfg)
+                matched = matched_segments(r)
                 if not matched:
                     out = r.copy()
                     out["audit_result"] = "未匹配到codebook适用范围"
@@ -481,6 +527,26 @@ def process_codebook_data(codebook, data, cfg=CFG):
 
         # B1：只有年份变化
         if not is_month_level:
+            year_coverage_cache = {}
+
+            def covered_segments(row, year):
+                city = str(row.get(cfg["data_city"], "") or "").strip()
+                dist = str(row.get(cfg["data_dist"], "") or "").strip()
+                cache_key = (city, dist, int(year))
+                if cache_key not in year_coverage_cache:
+                    matched_rows = [
+                        cr for cr in scope_cache.get((city, dist), [])
+                        if bool(cr.get("_has_period", False))
+                    ]
+                    covered = []
+                    for cr in matched_rows:
+                        yf = cr[cfg["code_year_from"]]
+                        yt = cr[cfg["code_year_to"]]
+                        if (not is_blank(yf)) and (not is_blank(yt)) and int(yf) <= int(year) <= int(yt):
+                            covered.append(cr)
+                    year_coverage_cache[cache_key] = covered
+                return year_coverage_cache[cache_key]
+
             for _, r in sub.iterrows():
                 y = to_int_scalar(r[cfg["data_year"]])
                 if pd.isna(y):
@@ -490,14 +556,7 @@ def process_codebook_data(codebook, data, cfg=CFG):
                     issues.append(out)
                     continue
 
-                matched = get_segments_for_row(r, valid_rows, cfg)
-                covered = []
-                for cr in matched:
-                    yf = cr[cfg["code_year_from"]]
-                    yt = cr[cfg["code_year_to"]]
-                    if (not is_blank(yf)) and (not is_blank(yt)) and \
-                            int(yf) <= int(y) <= int(yt):
-                        covered.append(cr)
+                covered = covered_segments(r, y)
 
                 if len(covered) == 0:
                     out = r.copy()
@@ -532,7 +591,7 @@ def process_codebook_data(codebook, data, cfg=CFG):
         for gkey, g in sub.groupby(group_cols, dropna=False):
             first = g.iloc[0]
 
-            segs = get_segments_for_row(first, valid_rows, cfg)
+            segs = [cr for cr in matched_segments(first) if bool(cr.get("_has_period", False))]
             if not segs:
                 for _, r in g.iterrows():
                     out = r.copy()
