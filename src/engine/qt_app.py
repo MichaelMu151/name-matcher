@@ -625,6 +625,18 @@ class MainWindow(QMainWindow):
                 input_frame = pd.read_excel(self.source_path, dtype=object, usecols=usecols)
             else:
                 input_frame = pd.read_csv(self.source_path, dtype=object, usecols=lambda column: column in {"year", "cityname", "distname", "w_name", "w_name_o", "wrank20", "wrank_t", "post_rank", "p_name", "styr", "stmo", "fiyr", "fimo", "record_id"})
+            # Duplicate Excel headers make row["field"] return a DataFrame
+            # instead of a scalar and later boolean checks become ambiguous.
+            duplicate_headers = [str(name) for name in input_frame.columns[input_frame.columns.duplicated()].tolist()]
+            conflicting_headers = []
+            for name in dict.fromkeys(duplicate_headers):
+                repeated = input_frame.loc[:, input_frame.columns == name]
+                if len(repeated.columns) > 1 and not repeated.nunique(dropna=False).le(1).all():
+                    conflicting_headers.append(name)
+            if conflicting_headers:
+                raise ValueError("变动审核无法继续：输入文件存在内容不一致的重复列名：" + "、".join(conflicting_headers) + "。请先在 Excel 中保留唯一列名。")
+            if duplicate_headers:
+                input_frame = input_frame.loc[:, ~input_frame.columns.duplicated()].copy()
             self.progress.setValue(15); self.progress.setFormat("变动审核：已读取阶段文件　15%"); QApplication.processEvents()
             cb = Codebook(Path(self.codebook.text()))
             self.progress.setValue(25); self.progress.setFormat("变动审核：已读取 codebook　25%"); QApplication.processEvents()
