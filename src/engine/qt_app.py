@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pandas as pd
 from openpyxl import load_workbook
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
@@ -457,7 +457,13 @@ class MainWindow(QMainWindow):
         help_tab = QWidget(); help_layout = QVBoxLayout(help_tab); help_layout.setContentsMargins(22, 18, 22, 18); pages.addWidget(help_tab)
         help = QLabel("<h2>怎么开始</h2><p>1. 在“运行配置”选择待审核 Excel 和 codebook。<br>2. 填写年鉴起点和终点年月；缺失任职年月会按这里临时补充，导出前恢复。<br>3. 如果要使用 DeepSeek，选择“DeepSeek API”并填写 Key；否则选择“不使用外部 LLM”。<br>4. 点击“开始运行”，程序完成后会自动切换到“人工复核”。<br>5. 点击“打开候选卡片复核（按名称组）”，同名记录会合并处理。</p><h2>完整工作流程</h2><p>人工复核完成后，点击“保存本批复核结果”。程序会生成独立的“_人工复核完成.xlsx”文件，原始输入文件不变，并自动把这个阶段文件送入“变动审阅”。变动审阅会根据当前 codebook 的 cityname/distname 自动确定范围，结果是建议报告，不会自动改数据。你根据报告在 Excel 中人工修改并保存一个新文件，最后进入“post_rank 审阅”上传这个修改后的文件。上传后，程序会先把 codebook 中标为 00待处理 的部门对应行的 wrank20 统一为 00待处理，再生成 post_rank 建议。</p><h2>人工复核怎么看</h2><p>候选卡片中的每次点击都会先进入“本批暂存”，不会立刻写 Excel。你可以在页面下方检查暂存的标准名称、级别和部门类型；确认无误后再保存。alias 冲突会阻止对应记录写入，并保留在暂存区供修改。</p><h2>结果文件</h2><p>运行目录会生成 reviewed_content.xlsx、review_queue.xlsx、modification_log.xlsx；变动审阅会生成名称有效期和变动阶段问题报告；post_rank 审阅只生成建议，不会自动写回。</p>")
         help.setWordWrap(True); help_layout.addWidget(help); help_layout.addStretch()
-        self.table = QTableWidget(); self._configure_table(self.table); preview_page = QWidget(); preview_layout = QVBoxLayout(preview_page); preview_layout.setContentsMargins(2, 4, 2, 2); preview_layout.addWidget(self.table); pages.insertWidget(1, preview_page)
+        preview_page = QWidget(); preview_layout = QVBoxLayout(preview_page); preview_layout.setContentsMargins(2, 4, 2, 2)
+        checklist_box = QGroupBox("流程检查清单")
+        checklist_layout = QVBoxLayout(checklist_box)
+        self.checklist_label = QLabel(); self.checklist_label.setWordWrap(True); self.checklist_label.setTextFormat(Qt.RichText)
+        checklist_layout.addWidget(self.checklist_label); preview_layout.addWidget(checklist_box)
+        pages.insertWidget(1, preview_page)
+        self._refresh_checklist()
         review_tab = QWidget(); review_layout = QVBoxLayout(review_tab); review_layout.setContentsMargins(2, 4, 2, 2); pages.insertWidget(2, review_tab)
         review_bar = QHBoxLayout(); review_layout.addLayout(review_bar)
         review_bar.addWidget(QLabel("问题类型")); self.review_filter = QComboBox(); self.review_filter.addItems(["全部问题", "错误输入", "有冲突", "多种可能", "缺失输入"]); self.review_filter.currentTextChanged.connect(self._refresh_review); review_bar.addWidget(self.review_filter); review_bar.addStretch()
@@ -479,6 +485,8 @@ class MainWindow(QMainWindow):
         review_layout.addWidget(batch_box)
 
         change_tab = QWidget(); change_layout = QVBoxLayout(change_tab); change_layout.setContentsMargins(2, 4, 2, 2); change_layout.setSpacing(10); pages.insertWidget(3, change_tab)
+        change_notice = QLabel("⚠ 进入变动审核前，请确认当前‘标准 codebook’已经是人工复核后的最新版本。若人工审核过程中新增、修改或合并了 codebook 记录，请先在‘开始运行’页面重新选择并确认新的 codebook，再上传人工复核完成文件。变动审核会以这两个文件的当前版本为准。")
+        change_notice.setWordWrap(True); change_notice.setObjectName("stageNotice"); change_notice.setMinimumHeight(54); change_layout.addWidget(change_notice)
         change_intro = QLabel("本卡接收人工复核保存后生成的‘_人工复核完成.xlsx’；根据当前 codebook 的 cityname/distname 自动确定审阅范围，检查 w_name、s1_sector、wrank_t，并在扩充完成后补填覆盖 2020 年的 wrank20。结果只提供人工审核建议，不自动修改原始数据。")
         change_intro.setWordWrap(True); change_intro.setObjectName("hint"); change_layout.addWidget(change_intro)
         change_bar = QHBoxLayout(); self.change_count = QLabel("请先运行，或加载‘_人工复核完成.xlsx’"); change_bar.addWidget(self.change_count); change_bar.addStretch(); self.change_stage_button = QPushButton("加载人工复核完成文件"); self.change_stage_button.clicked.connect(self._load_human_reviewed_stage); change_bar.addWidget(self.change_stage_button); self.change_refresh_button = QPushButton("刷新变动审阅"); self.change_refresh_button.setObjectName("primary"); self.change_refresh_button.clicked.connect(self._load_change_audit); change_bar.addWidget(self.change_refresh_button); self.change_export_button = QPushButton("导出扩行结果"); self.change_export_button.clicked.connect(self._export_change_expansion); change_bar.addWidget(self.change_export_button); change_layout.addLayout(change_bar)
@@ -495,12 +503,22 @@ class MainWindow(QMainWindow):
 
         post_tab = QWidget(); post_layout = QVBoxLayout(post_tab); post_layout.setContentsMargins(2,4,2,2); pages.insertWidget(4, post_tab)
         post_layout.addWidget(QLabel("请先在变动审核中人工修改并保存 Excel，再在这里上传修改后的文件。上传后程序会先按 codebook 自动把匹配到 00待处理 部门的 wrank20 统一为 00待处理，并生成独立阶段文件；随后读取当前 wrank_t，使用 4post_rank.R 的四组职位词表识别 post1，推导理论 post_rank 并列出不一致与未知职位。post_rank 本身不会自动写回。"))
-        post_bar=QHBoxLayout(); self.post_file_label=QLabel("尚未上传变动审核完成文件"); post_bar.addWidget(self.post_file_label); self.post_upload_button=QPushButton("上传并生成 post_rank 审阅"); self.post_upload_button.setObjectName("primary"); self.post_upload_button.clicked.connect(self._load_post_rank_review); post_bar.addWidget(self.post_upload_button); post_layout.addLayout(post_bar)
+        post_bar=QHBoxLayout(); self.post_file_label=QLabel("尚未上传变动审核完成文件"); post_bar.addWidget(self.post_file_label); self.post_upload_button=QPushButton("上传并生成 post_rank 审阅"); self.post_upload_button.setObjectName("primary"); self.post_upload_button.clicked.connect(self._load_post_rank_review); post_bar.addWidget(self.post_upload_button); self.post_finalize_button=QPushButton("安全校验并生成最终成稿"); self.post_finalize_button.setEnabled(False); self.post_finalize_button.clicked.connect(self._finalize_post_rank); post_bar.addWidget(self.post_finalize_button); post_layout.addLayout(post_bar)
         self.post_count=QLabel("等待上传"); post_layout.addWidget(self.post_count); self.post_table=QTableWidget(); self._configure_table(self.post_table); post_layout.addWidget(self.post_table)
 
     def _configure_table(self, table: QTableWidget) -> None:
         table.setAlternatingRowColors(True); table.setSelectionBehavior(QAbstractItemView.SelectRows); table.setEditTriggers(QAbstractItemView.NoEditTriggers); table.setWordWrap(False)
         table.verticalHeader().setVisible(False); table.horizontalHeader().setStretchLastSection(True); table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive); table.setSortingEnabled(True)
+
+    def _refresh_checklist(self) -> None:
+        result = getattr(self, "result", None) or {}
+        human_stage = bool(self.source_path and self.source_path.exists() and "人工复核完成" in self.source_path.stem)
+        change_ready = bool(getattr(self, "_change_audit", None))
+        post_ready = bool(getattr(self, "_post_uploaded_path", None))
+        final_path = getattr(self, "_final_output_path", None)
+        final_ready = bool(final_path and Path(final_path).exists())
+        rows = [(bool(result), "初始匹配"), (human_stage, "人工复核阶段文件"), (change_ready, "变动审阅报告"), (post_ready, "post_rank 审阅文件"), (final_ready, "最终成稿")]
+        self.checklist_label.setText("<br>".join(("✅ " if done else "○ ") + label for done, label in rows))
 
     def _path_row(self, edit: QLineEdit, title: str, save: bool = True) -> QWidget:
         widget = QWidget(); row = QHBoxLayout(widget); row.setContentsMargins(0, 0, 0, 0); row.addWidget(edit)
@@ -527,7 +545,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def on_finished(self, result: dict) -> None:
-        self.result = result; self.source_path = Path(result.get("input_path", "")) if result.get("input_path") else self.source_path; self.progress.setValue(100); self.status.setText(f"完成：{result['input_rows']:,} 行，{result['unique_queries']:,} 条去重查询"); self.log.appendPlainText(self.status.text()); self.header_status.setText("● 已完成"); self.header_status.setStyleSheet("color:#2a8b63;background:#e2f4eb;border-radius:12px;padding:6px 12px;font-weight:700;"); self._load_preview(Path(result["output_dir"]) / "debug" / "queries.jsonl"); self.nav_list.setCurrentRow(2)
+        self.result = result; self.source_path = Path(result.get("input_path", "")) if result.get("input_path") else self.source_path; self.debug_frame = pd.read_json(Path(result["output_dir"]) / "debug" / "queries.jsonl", lines=True); self._scoped_review_frame = None; self._scoped_review_source = None; self.progress.setValue(100); self.status.setText(f"完成：{result['input_rows']:,} 行，{result['unique_queries']:,} 条去重查询"); self.log.appendPlainText(self.status.text()); self.header_status.setText("● 已完成"); self.header_status.setStyleSheet("color:#2a8b63;background:#e2f4eb;border-radius:12px;padding:6px 12px;font-weight:700;"); self._refresh_checklist(); self.nav_list.setCurrentRow(2)
 
     @staticmethod
     def _as_int(value):
@@ -590,6 +608,13 @@ class MainWindow(QMainWindow):
     def _load_change_audit(self) -> None:
         if self.source_path is None or not self.source_path.exists():
             self.change_count.setText("请先选择或运行输入数据"); return
+        self.change_refresh_button.setEnabled(False)
+        self.change_count.setText("正在读取阶段文件并生成变动审核，请稍候…")
+        self.status.setText("正在生成变动审核：读取文件、匹配范围并处理有效期…")
+        self.header_status.setText("● 变动审核处理中")
+        self.header_status.setStyleSheet("color:#9b641c;background:#fff0d8;border-radius:12px;padding:6px 12px;font-weight:700;")
+        self.progress.setRange(0, 100); self.progress.setValue(0); self.progress.setFormat("变动审核：准备开始")
+        QApplication.processEvents()
         try:
             if self.source_path.suffix.lower() != ".csv":
                 # The change audit only needs these fields.  Avoid loading
@@ -600,10 +625,13 @@ class MainWindow(QMainWindow):
                 input_frame = pd.read_excel(self.source_path, dtype=object, usecols=usecols)
             else:
                 input_frame = pd.read_csv(self.source_path, dtype=object, usecols=lambda column: column in {"year", "cityname", "distname", "w_name", "w_name_o", "wrank20", "wrank_t", "post_rank", "p_name", "styr", "stmo", "fiyr", "fimo", "record_id"})
+            self.progress.setValue(15); self.progress.setFormat("变动审核：已读取阶段文件　15%"); QApplication.processEvents()
             cb = Codebook(Path(self.codebook.text()))
+            self.progress.setValue(25); self.progress.setFormat("变动审核：已读取 codebook　25%"); QApplication.processEvents()
             # Scope is determined by the current codebook, not by a hardcoded
             # city.  Blank city/dist cells in codebook act as wildcards.
             input_frame = self._filter_codebook_scope(input_frame, cb)
+            self.progress.setValue(40); self.progress.setFormat("变动审核：已完成 cityname/distname 范围筛选　40%"); QApplication.processEvents()
             change_rows = [row for row in cb.valid_rows() if not row.all_time_empty]
             cb_records = []
             for row in change_rows:
@@ -629,8 +657,28 @@ class MainWindow(QMainWindow):
                 department_records.append({"cityname": cityname, "distname": distname, "w_name": w_name, "变化字段": "、".join(fields), "s1_sector范围": " → ".join(sectors), "wrank_t范围": " → ".join(ranks), "有效期段数": len(items), "备注": notes_text})
             self.change_departments_frame = pd.DataFrame(department_records)
             self._fill_table(self.change_department_table, self.change_departments_frame, ["cityname", "distname", "w_name", "变化字段", "s1_sector范围", "wrank_t范围", "有效期段数", "备注"])
+            self.progress.setValue(55); self.progress.setFormat("变动审核：已识别 codebook 变动部门　55%"); QApplication.processEvents()
             audit, transformed, demos = self._build_change_preview_expanded(input_frame, cb)
-            self.change_audit_frame = audit; self.change_transformed_frame = transformed
+            self.progress.setValue(85); self.progress.setFormat("变动审核：已完成有效期匹配与任职区间拆分　85%"); QApplication.processEvents()
+            # 页面按部门汇总“级别未变但 wrank 不统一”，避免同一部门的
+            # 年度记录重复占满审核表；逐行明细仍保留在扩充结果文件中。
+            if not audit.empty and "issue_type" in audit.columns:
+                mismatch = audit["issue_type"].astype(str).eq("级别没变但是wrank不统一")
+                if mismatch.any():
+                    detail = audit.loc[mismatch].copy()
+                    group_cols = [c for c in ["cityname", "distname", "w_name"] if c in detail.columns]
+                    if group_cols:
+                        summaries = []
+                        for _, group in detail.groupby(group_cols, dropna=False, sort=False):
+                            first = group.iloc[0].copy()
+                            wrt = "、".join(sorted({str(v).strip() for v in group.get("wrank_t", []) if str(v).strip() and str(v).strip().lower() != "nan"}))
+                            wr20 = "、".join(sorted({str(v).strip() for v in group.get("wrank20", []) if str(v).strip() and str(v).strip().lower() != "nan"}))
+                            first["reason"] = f"该部门级别没变但 wrank_t 是{wrt or '空'}，wrank20 是{wr20 or '空'}"
+                            first["条数"] = len(group)
+                            summaries.append(first)
+                        summary_frame = pd.DataFrame(summaries)
+                        audit = pd.concat([audit.loc[~mismatch], summary_frame], ignore_index=True)
+            self.change_audit_frame = audit; self.change_transformed_frame = transformed; self._change_audit = audit; self._refresh_checklist()
             if self.result and self.result.get("output_dir") and not audit.empty:
                 temporal_rows = audit[audit["issue_type"].astype(str).isin({"w_name超出有效期", "w_name有效期无法判断"})].copy()
                 if not temporal_rows.empty:
@@ -648,6 +696,7 @@ class MainWindow(QMainWindow):
             self._fill_table(self.change_issue_table, audit, ["year", "p_name", "cityname", "distname", "w_name", "issue_type", "reason"])
             self.change_count.setText(f"codebook 变动记录 {len(change_rows):,} 条；检测到变动相关输入 {getattr(self, '_change_input_count', 0):,} 条；名称超出有效期 {issue_counts.get('w_name超出有效期', 0):,} 条；级别未变但 wrank 不统一 {issue_counts.get('级别没变但是wrank不统一', 0):,} 条；可演示人员 {len(demos):,} 组")
             self.change_summary_label.setText(self._format_change_summary(audit))
+            self.progress.setValue(100); self.progress.setFormat("变动审核：报告生成完成　100%")
             if demos:
                 sample = random.choice(demos)
                 self.change_demo_label.setText(f"示例部门：{sample['w_name']}　｜　人员：{sample['p_name']}　｜　城市/区县：{sample['cityname']} / {sample['distname']}\n处理方式：{sample['description']}")
@@ -656,6 +705,15 @@ class MainWindow(QMainWindow):
                 self.change_demo_label.setText("当前输入中没有找到可以展示的变动人员样本。"); self.change_demo_table.clearContents(); self.change_demo_table.setRowCount(0)
         except Exception as exc:
             self.change_count.setText(f"变动审阅生成失败：{exc}")
+            self.status.setText(f"变动审阅失败：{exc}")
+        finally:
+            self.change_refresh_button.setEnabled(True)
+            self.progress.setRange(0, 100)
+            if not self.change_count.text().startswith("变动审阅生成失败"):
+                self.status.setText("变动审核完成，可以查看报告并人工处理。")
+                self.header_status.setText("● 变动审核完成")
+                self.header_status.setStyleSheet("color:#2a8b63;background:#e2f4eb;border-radius:12px;padding:6px 12px;font-weight:700;")
+            QApplication.processEvents()
 
     def _load_human_reviewed_stage(self) -> None:
         """Load a saved human-review stage without rerunning the matcher."""
@@ -670,10 +728,13 @@ class MainWindow(QMainWindow):
         selected = Path(path)
         self.source_path = selected
         self.result = None
-        self.status.setText(f"已加载人工复核完成文件：{selected.name}")
+        self.status.setText(f"已选择文件：{selected.name}，即将开始变动审核…")
         self.log.appendPlainText(self.status.text())
-        self._load_change_audit()
         self.nav_list.setCurrentRow(3)
+        # Let Qt paint the selected-file message before starting the heavy
+        # audit.  Calling the audit synchronously here made the whole window
+        # appear frozen immediately after the native file dialog closed.
+        QTimer.singleShot(0, self._load_change_audit)
 
     @staticmethod
     def _format_change_summary(audit: pd.DataFrame) -> str:
@@ -685,11 +746,17 @@ class MainWindow(QMainWindow):
     def _load_post_rank_review(self) -> None:
         path,_=QFileDialog.getOpenFileName(self,"选择已完成变动审核的 Excel","","Excel (*.xlsx *.xlsm)")
         if not path: return
+        self.post_upload_button.setEnabled(False); self.post_count.setText("正在读取文件并生成 post_rank 审阅，请稍候…"); QApplication.processEvents()
         try:
             # Before post_rank review, apply the deterministic 2020-level
             # cleanup requested by the user.  The uploaded file is preserved;
             # the next-stage copy receives the wrank20 updates.
             prepared_path, wrank20_changes = self._prepare_wrank20_stage(Path(path))
+            self._post_uploaded_path = Path(path)
+            baseline = Path(path).with_name(Path(path).stem + "_post_rank基线" + Path(path).suffix)
+            if not baseline.exists():
+                shutil.copy2(path, baseline)
+            self._post_baseline_path = baseline
             full_frame = pd.read_excel(prepared_path,dtype=object)
             if not {"cityname","distname"}.issubset(full_frame.columns): raise ValueError("文件缺少 cityname 或 distname")
             post_codebook = Codebook(Path(self.codebook.text()))
@@ -704,7 +771,53 @@ class MainWindow(QMainWindow):
                 self._fill_table(self.post_table, post_audit, ["year", "cityname", "distname", "w_name", "post1", "wrank_t", "职位类别", "理论post_rank", "原post_rank", "issue_type"])
             else:
                 self._fill_table(self.post_table,pd.DataFrame(),["year", "w_name", "post1", "wrank_t", "理论post_rank", "原post_rank", "issue_type"])
+            self.post_finalize_button.setEnabled(True); self._refresh_checklist()
         except Exception as exc: self.post_count.setText(f"post_rank 审阅失败：{exc}")
+        finally:
+            self.post_upload_button.setEnabled(True); QApplication.processEvents()
+
+    def _finalize_post_rank(self) -> None:
+        """Validate the manually edited post_rank file and create final output."""
+        uploaded = getattr(self, "_post_uploaded_path", None)
+        baseline = getattr(self, "_post_baseline_path", None)
+        if uploaded is None or baseline is None or not Path(uploaded).exists() or not Path(baseline).exists():
+            QMessageBox.information(self, "尚未准备完成", "请先上传修改后的 post_rank 文件。")
+            return
+        try:
+            source_book = load_workbook(baseline, data_only=False)
+            edited_book = load_workbook(uploaded, data_only=False)
+            if source_book.sheetnames != edited_book.sheetnames:
+                raise ValueError("安全校验失败：工作表集合发生变化")
+            allowed = {"post_rank"}
+            changes = []
+            for sheet_name in source_book.sheetnames:
+                old_sheet, new_sheet = source_book[sheet_name], edited_book[sheet_name]
+                if old_sheet.max_row != new_sheet.max_row or old_sheet.max_column != new_sheet.max_column:
+                    raise ValueError(f"安全校验失败：{sheet_name} 行列数量发生变化")
+                headers = {str(old_sheet.cell(1, c).value).strip(): c for c in range(1, old_sheet.max_column + 1) if old_sheet.cell(1, c).value is not None}
+                if "post_rank" not in headers:
+                    continue
+                post_col = headers["post_rank"]
+                for row in range(2, old_sheet.max_row + 1):
+                    old_value, new_value = old_sheet.cell(row, post_col).value, new_sheet.cell(row, post_col).value
+                    if old_value != new_value:
+                        changes.append({"sheet": sheet_name, "source_row": row, "field": "post_rank", "before": old_value, "after": new_value})
+                for col in range(1, old_sheet.max_column + 1):
+                    header = str(old_sheet.cell(1, col).value or "").strip()
+                    if header in allowed or not header:
+                        continue
+                    for row in range(1, old_sheet.max_row + 1):
+                        if old_sheet.cell(row, col).value != new_sheet.cell(row, col).value:
+                            raise ValueError(f"安全校验失败：{header}!{row} 被修改；post_rank 阶段只允许修改 post_rank")
+            final_path = Path(uploaded).with_name(Path(uploaded).stem.replace("_post_rank基线", "") + "_最终成稿" + Path(uploaded).suffix)
+            shutil.copy2(uploaded, final_path)
+            log_path = final_path.with_name(final_path.stem + "_post_rank修改日志.xlsx")
+            pd.DataFrame(changes, columns=["sheet", "source_row", "field", "before", "after"]).to_excel(log_path, index=False)
+            self.post_count.setText(f"安全校验通过：{len(changes):,} 条 post_rank 修改；最终成稿已生成：{final_path.name}")
+            self._final_output_path = final_path; self._refresh_checklist()
+            QMessageBox.information(self, "最终成稿已生成", f"{final_path}\n\n修改日志：{log_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "最终成稿未生成", str(exc))
 
     def _prepare_wrank20_stage(self, path: Path) -> tuple[Path, int]:
         """Create a post-review stage file with codebook 00-rank cleanup.
@@ -1037,6 +1150,13 @@ class MainWindow(QMainWindow):
         return pairs
 
     def _apply_review_scope(self, frame: pd.DataFrame) -> pd.DataFrame:
+        if "scope_match" in frame.columns:
+            cached = frame.copy()
+            cached["_scope_match"] = cached["scope_match"].fillna(False).astype(bool)
+            return cached
+        cached = getattr(self, "_scoped_review_frame", None)
+        if cached is not None and getattr(self, "_scoped_review_source", None) is frame:
+            return cached
         frame = frame.copy()
         try:
             cb = Codebook(Path(self.codebook.text()))
@@ -1046,6 +1166,8 @@ class MainWindow(QMainWindow):
             frame["_scope_match"] = False
         else:
             frame["_scope_match"] = frame.apply(lambda row: self._row_matches_codebook_scope(row, cb), axis=1)
+        self._scoped_review_source = self.debug_frame if hasattr(self, "debug_frame") else None
+        self._scoped_review_frame = frame
         return frame
 
     def open_human_review(self) -> None:
@@ -1067,7 +1189,10 @@ class MainWindow(QMainWindow):
             return
         # Group exact raw names within the same geographic context. This keeps
         # one decision per repeated name while avoiding cross-city spillover.
-        group_columns = [column for column in ["raw_name", "cityname", "distname", "existing_w_name", "existing_wrank_t", "existing_s1_sector", "issue_type", "issue_fields"] if column in review.columns]
+        if "review_group_key" in review.columns:
+            group_columns = ["review_group_key"]
+        else:
+            group_columns = [column for column in ["raw_name", "cityname", "distname", "existing_w_name", "existing_wrank_t", "existing_s1_sector", "issue_type", "issue_fields"] if column in review.columns]
         if "candidate_ids" in review.columns:
             review["_review_candidate_key"] = review["candidate_ids"].map(lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
             group_columns.append("_review_candidate_key")
@@ -1106,14 +1231,6 @@ class MainWindow(QMainWindow):
             if 0 <= index < len(self.pending_decisions): self.pending_decisions.pop(index)
         self._persist_pending_batch()
         self._refresh_batch_view()
-
-    def _load_preview(self, path: Path) -> None:
-        self.debug_frame = pd.read_json(path, lines=True)
-        frame = self.debug_frame.head(200); columns = [c for c in ["raw_name", "decision", "entity_id", "method", "reason"] if c in frame.columns]; self.table.setRowCount(len(frame)); self.table.setColumnCount(len(columns)); self.table.setHorizontalHeaderLabels(columns)
-        for i, (_, row) in enumerate(frame.iterrows()):
-            for j, col in enumerate(columns): self.table.setItem(i, j, QTableWidgetItem(str(row.get(col, ""))))
-        self.table.resizeColumnsToContents()
-        self._refresh_review()
 
     def _refresh_batch_view(self) -> None:
         rows = self.pending_decisions
@@ -1401,15 +1518,11 @@ class MainWindow(QMainWindow):
             # deterministic stages.
             self._apply_source_updates(reviewed_output, decisions, apply_post_rank=False)
             self._set_save_progress(60, "已生成人工复核完成文件")
-            post_rank_logs, temporal_issues = self._apply_temporal_postprocess(reviewed_output, codebook_path)
-            if self.result and self.result.get("reviewed_content"):
-                reviewed = Path(self.result["reviewed_content"])
-                if reviewed.exists() and reviewed.resolve() != self.source_path.resolve():
-                    self._apply_source_updates(reviewed, decisions, apply_post_rank=False)
-                    reviewed_logs, reviewed_issues = self._apply_temporal_postprocess(reviewed, codebook_path)
-                    post_rank_logs = reviewed_logs or post_rank_logs
-                    temporal_issues = reviewed_issues or temporal_issues
-            self._set_save_progress(80, "已完成变动审阅报告（未写回）")
+            # The expensive temporal expansion belongs to the explicit
+            # change-review stage.  Running it here blocked the GUI while
+            # saving and also caused the same workbook to be scanned twice.
+            post_rank_logs, temporal_issues = [], []
+            self._set_save_progress(80, "阶段文件已保存，等待变动审阅")
             if self.result and self.result.get("output_dir") and post_rank_logs:
                 log_path = Path(self.result["output_dir"]) / "post_rank_adjustment_log.xlsx"
                 pd.DataFrame(post_rank_logs).to_excel(log_path, index=False)
@@ -1464,7 +1577,7 @@ class MainWindow(QMainWindow):
             self.source_path = reviewed_output
             self.status.setText(f"人工复核已保存：{reviewed_output.name}；现在可进入‘变动审阅’。")
             self.log.appendPlainText(self.status.text())
-            self._load_change_audit()
+            self._refresh_checklist()
             self.nav_list.setCurrentRow(3)
         except Exception as exc:
             self._set_save_progress(0, "保存失败")
@@ -1485,6 +1598,7 @@ class MainWindow(QMainWindow):
                 self.debug_frame = pd.read_excel(p)
             else:
                 self.debug_frame = pd.read_json(p, lines=True)
+            self._scoped_review_frame = None; self._scoped_review_source = None
             self.source_path = None
             self._show_loaded_frame()
             self.status.setText(f"已加载人工复核队列：{int(self.debug_frame['decision'].isin({'HUMAN', 'MULTIPLE'}).sum()) if 'decision' in self.debug_frame.columns else len(self.debug_frame):,} 条")
@@ -1492,11 +1606,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "加载失败", f"无法读取审核队列：{exc}")
 
     def _show_loaded_frame(self) -> None:
-        frame = self.debug_frame.head(200); columns = [c for c in ["raw_name", "decision", "entity_id", "method", "reason"] if c in frame.columns]
-        self.table.setRowCount(len(frame)); self.table.setColumnCount(len(columns)); self.table.setHorizontalHeaderLabels(columns)
-        for i, (_, row) in enumerate(frame.iterrows()):
-            for j, col in enumerate(columns): self.table.setItem(i, j, QTableWidgetItem(str(row.get(col, ""))))
-        self.table.resizeColumnsToContents(); self._refresh_review()
+        self._refresh_review()
 
     def _refresh_review(self) -> None:
         if not hasattr(self, "debug_frame"):
@@ -1549,6 +1659,7 @@ def main() -> int:
         QLabel#title { font-size: 25px; font-weight: 700; color: #153b5b; padding: 4px 2px 8px; background: transparent; }
         QLabel#title .subtitle { font-size: 13px; font-weight: 400; color: #6b7d8f; }
         QLabel#hint { color: #617487; padding: 4px 2px; background: transparent; }
+        QLabel#stageNotice { color: #7a4b00; background: #fff4d6; border: 1px solid #e5bd67; border-radius: 7px; padding: 10px 12px; font-weight: 700; }
         QLabel#ready { color: #2a8b63; background: #e2f4eb; border-radius: 12px; padding: 6px 12px; font-weight: 700; }
         QTabWidget::pane { border: 1px solid #d9e2ec; border-radius: 8px; background: #ffffff; top: -1px; }
         QTabBar::tab { background: #e9eff5; color: #516579; padding: 10px 18px; margin-right: 3px; border-top-left-radius: 7px; border-top-right-radius: 7px; }
