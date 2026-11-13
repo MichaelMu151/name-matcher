@@ -527,7 +527,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def on_finished(self, result: dict) -> None:
-        self.result = result; self.source_path = Path(result.get("input_path", "")) if result.get("input_path") else self.source_path; self.progress.setValue(100); self.status.setText(f"完成：{result['input_rows']:,} 行，{result['unique_queries']:,} 条去重查询"); self.log.appendPlainText(self.status.text()); self.header_status.setText("● 已完成"); self.header_status.setStyleSheet("color:#2a8b63;background:#e2f4eb;border-radius:12px;padding:6px 12px;font-weight:700;"); self._load_preview(Path(result["output_dir"]) / "debug" / "queries.jsonl"); self._load_change_audit(); self.nav_list.setCurrentRow(2)
+        self.result = result; self.source_path = Path(result.get("input_path", "")) if result.get("input_path") else self.source_path; self.progress.setValue(100); self.status.setText(f"完成：{result['input_rows']:,} 行，{result['unique_queries']:,} 条去重查询"); self.log.appendPlainText(self.status.text()); self.header_status.setText("● 已完成"); self.header_status.setStyleSheet("color:#2a8b63;background:#e2f4eb;border-radius:12px;padding:6px 12px;font-weight:700;"); self._load_preview(Path(result["output_dir"]) / "debug" / "queries.jsonl"); self.nav_list.setCurrentRow(2)
 
     @staticmethod
     def _as_int(value):
