@@ -7,7 +7,6 @@ import tempfile
 import json
 import ast
 import shutil
-import random
 import re
 from types import SimpleNamespace
 from pathlib import Path
@@ -499,7 +498,6 @@ class MainWindow(QMainWindow):
         self.change_department_box = QGroupBox("经历过级别、类别或名称变动的部门清单"); dept_layout = QVBoxLayout(self.change_department_box); self.change_department_table = QTableWidget(); self._configure_table(self.change_department_table); dept_layout.addWidget(self.change_department_table)
         self.change_issue_box = QGroupBox("名称有效期和变动阶段问题"); issue_layout = QVBoxLayout(self.change_issue_box); self.change_issue_table = QTableWidget(); self._configure_table(self.change_issue_table); self.change_issue_table.setMinimumHeight(360); issue_layout.addWidget(self.change_issue_table); change_layout.addWidget(self.change_issue_box, 1)
         self.change_summary_box = QGroupBox("变动审核汇总"); sum_layout = QVBoxLayout(self.change_summary_box); self.change_summary_label = QLabel("运行后显示汇总"); self.change_summary_label.setWordWrap(True); self.change_summary_label.setMinimumHeight(105); sum_layout.addWidget(self.change_summary_label); change_layout.addWidget(self.change_summary_box)
-        self.change_demo_box = QGroupBox("随机抽取的变动人员示例"); demo_layout = QVBoxLayout(self.change_demo_box); self.change_demo_label = QLabel("运行后将在这里展示一个发生过变动或拆分的部门和人员。"); self.change_demo_label.setWordWrap(True); demo_layout.addWidget(self.change_demo_label); self.change_demo_table = QTableWidget(); self._configure_table(self.change_demo_table); demo_layout.addWidget(self.change_demo_table)
 
         post_tab = QWidget(); post_layout = QVBoxLayout(post_tab); post_layout.setContentsMargins(2,4,2,2); pages.insertWidget(4, post_tab)
         post_layout.addWidget(QLabel("请先在变动审核中人工修改并保存 Excel，再在这里上传修改后的文件。上传后程序会先按 codebook 自动把匹配到 00待处理 部门的 wrank20 统一为 00待处理，并生成独立阶段文件；随后读取当前 wrank_t，使用 4post_rank.R 的四组职位词表识别 post1，推导理论 post_rank 并列出不一致与未知职位。post_rank 本身不会自动写回。"))
@@ -602,7 +600,22 @@ class MainWindow(QMainWindow):
     def _filter_codebook_scope(self, frame: pd.DataFrame, codebook: Codebook) -> pd.DataFrame:
         if frame.empty:
             return frame.copy()
-        mask = frame.apply(lambda row: self._row_matches_codebook_scope(row, codebook), axis=1)
+        # Build the allowed geographic pairs once.  The former row-wise
+        # implementation scanned every codebook row for every data row.
+        exact_pairs: set[tuple[str, str]] = set()
+        wildcard_scopes: list[tuple[set[str], set[str]]] = []
+        for row in codebook.valid_rows():
+            cities = {normalize_name(value) for value in codebook.split_values(row.cityname) if normalize_name(value)}
+            dists = {normalize_name(value) for value in codebook.split_values(row.distname) if normalize_name(value)}
+            if cities and dists:
+                exact_pairs.update((city, dist) for city in cities for dist in dists)
+            else:
+                wildcard_scopes.append((cities, dists))
+        city_values = frame.get("cityname", pd.Series("", index=frame.index)).map(lambda value: normalize_name(self._as_text(value)))
+        dist_values = frame.get("distname", pd.Series("", index=frame.index)).map(lambda value: normalize_name(self._as_text(value)))
+        mask = pd.Series([(city, dist) in exact_pairs for city, dist in zip(city_values, dist_values)], index=frame.index)
+        for cities, dists in wildcard_scopes:
+            mask |= ((~city_values.isin(cities)) if not cities else city_values.isin(cities)) & ((~dist_values.isin(dists)) if not dists else dist_values.isin(dists))
         return frame.loc[mask].copy()
 
     def _load_change_audit(self) -> None:
@@ -670,7 +683,7 @@ class MainWindow(QMainWindow):
             self.change_departments_frame = pd.DataFrame(department_records)
             self._fill_table(self.change_department_table, self.change_departments_frame, ["cityname", "distname", "w_name", "变化字段", "s1_sector范围", "wrank_t范围", "有效期段数", "备注"])
             self.progress.setValue(55); self.progress.setFormat("变动审核：已识别 codebook 变动部门　55%"); QApplication.processEvents()
-            audit, transformed, demos = self._build_change_preview_expanded(input_frame, cb)
+            audit, transformed, _ = self._build_change_preview_expanded(input_frame, cb)
             self.progress.setValue(85); self.progress.setFormat("变动审核：已完成有效期匹配与任职区间拆分　85%"); QApplication.processEvents()
             # 页面按部门汇总“级别未变但 wrank 不统一”，避免同一部门的
             # 年度记录重复占满审核表；逐行明细仍保留在扩充结果文件中。
@@ -706,15 +719,9 @@ class MainWindow(QMainWindow):
                         merged_queue.to_excel(review_queue, index=False)
             issue_counts = audit["issue_type"].value_counts().to_dict() if not audit.empty else {}
             self._fill_table(self.change_issue_table, audit, ["year", "p_name", "cityname", "distname", "w_name", "issue_type", "reason"])
-            self.change_count.setText(f"codebook 变动记录 {len(change_rows):,} 条；检测到变动相关输入 {getattr(self, '_change_input_count', 0):,} 条；名称超出有效期 {issue_counts.get('w_name超出有效期', 0):,} 条；级别未变但 wrank 不统一 {issue_counts.get('级别没变但是wrank不统一', 0):,} 条；可演示人员 {len(demos):,} 组")
+            self.change_count.setText(f"codebook 变动记录 {len(change_rows):,} 条；检测到变动相关输入 {getattr(self, '_change_input_count', 0):,} 条；名称超出有效期 {issue_counts.get('w_name超出有效期', 0):,} 条；级别未变但 wrank 不统一 {issue_counts.get('级别没变但是wrank不统一', 0):,} 条")
             self.change_summary_label.setText(self._format_change_summary(audit))
             self.progress.setValue(100); self.progress.setFormat("变动审核：报告生成完成　100%")
-            if demos:
-                sample = random.choice(demos)
-                self.change_demo_label.setText(f"示例部门：{sample['w_name']}　｜　人员：{sample['p_name']}　｜　城市/区县：{sample['cityname']} / {sample['distname']}\n处理方式：{sample['description']}")
-                self._fill_table(self.change_demo_table, sample["frame"], list(sample["frame"].columns))
-            else:
-                self.change_demo_label.setText("当前输入中没有找到可以展示的变动人员样本。"); self.change_demo_table.clearContents(); self.change_demo_table.setRowCount(0)
         except Exception as exc:
             self.change_count.setText(f"变动审阅生成失败：{exc}")
             self.status.setText(f"变动审阅失败：{exc}")
@@ -897,7 +904,12 @@ class MainWindow(QMainWindow):
                 value = row.get(column, "")
                 if value is None or (isinstance(value, float) and pd.isna(value)): value = ""
                 table.setItem(i, j, QTableWidgetItem(str(value)))
-        table.resizeColumnsToContents(); table.setSortingEnabled(True)
+        # Measuring every cell is expensive for 500-row audit tables. The
+        # header remains interactive so the user can resize a column when
+        # needed; small tables still get a one-time automatic fit.
+        if len(frame) <= 80:
+            table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
 
     def _build_change_preview_expanded(self, frame: pd.DataFrame, cb: Codebook):
         """Run the standalone department expansion engine for the change card.
@@ -969,25 +981,10 @@ class MainWindow(QMainWindow):
             audit["reason"] = audit["audit_result"]
         self._change_input_count = len(audit)
         transformed = result.processed.copy()
-        demos = []
-        if "_split_flag" in transformed.columns:
-            split = transformed[transformed["_split_flag"].fillna(0).astype(str).isin({"1", "1.0"})]
-            if not split.empty:
-                group_columns = [column for column in ["p_name", "w_name", "w_name_o"] if column in split.columns]
-                for _, group in split.groupby(group_columns or [split.index], dropna=False, sort=False):
-                    sample = group.head(20).copy()
-                    display_columns = [column for column in ["year", "p_name", "w_name_o", "w_name", "s1_sector", "wrank20", "wrank_t", "post_rank", "styr", "stmo", "fiyr", "fimo", "_split_flag", "_segment_start", "_segment_end", "audit_result"] if column in sample.columns]
-                    demos.append({
-                        "w_name": str(group.iloc[0].get("w_name") or group.iloc[0].get("w_name_o") or "").strip(),
-                        "p_name": str(group.iloc[0].get("p_name") or "").strip() or "（未记录姓名）",
-                        "cityname": group.iloc[0].get("cityname", ""),
-                        "distname": group.iloc[0].get("distname", ""),
-                        "description": "来自部门扩充模块：按有效期节点生成变化前/变化后分段。",
-                        "frame": sample[display_columns],
-                    })
-                    if len(demos) >= 20:
-                        break
-        return audit, transformed, demos
+        # The UI only needs the audit table and full expansion export.  Do not
+        # build random demonstration samples from the expanded frame: that
+        # caused another groupby and copied up to 20 rows per split group.
+        return audit, transformed, []
 
     def _export_change_expansion(self) -> None:
         result = getattr(self, "_last_expansion_result", None)
@@ -1059,6 +1056,10 @@ class MainWindow(QMainWindow):
         changed_frame = frame.copy()
         changed_frame["_change_action"] = ""
         changed_frame["_source_index"] = changed_frame.index
+        # Legacy callers receive the audit and transformed frame only.  The
+        # former random demonstration construction duplicated grouping and
+        # copied rows without affecting any audit decision.
+        return pd.DataFrame(audit_records), changed_frame, []
         demos = []
         group_cols = [column for column in ["p_name", "cityname", "distname", "w_name", "w_name_o"] if column in frame.columns]
         if not group_cols: group_cols = ["_source_index"]
@@ -1253,7 +1254,8 @@ class MainWindow(QMainWindow):
             values = row.get("values", {})
             display = {"raw_name": row.get("raw_name", ""), "action": row.get("action", ""), "w_name": values.get("w_name", ""), "wrank_t": values.get("wrank_t", ""), "s1_sector": values.get("s1_sector", ""), "entity_id": row.get("entity_id", ""), "note": row.get("note", "")}
             for j, col in enumerate(columns): self.batch_table.setItem(i, j, QTableWidgetItem(str(display.get(col, ""))))
-        self.batch_table.resizeColumnsToContents()
+        if len(rows) <= 80:
+            self.batch_table.resizeColumnsToContents()
 
     def _set_save_progress(self, value: int, message: str) -> None:
         if not hasattr(self, "save_progress"):
@@ -1642,7 +1644,8 @@ class MainWindow(QMainWindow):
         self.review_table.setRowCount(len(frame)); self.review_table.setColumnCount(len(columns)); self.review_table.setHorizontalHeaderLabels(columns)
         for i, (_, row) in enumerate(frame.iterrows()):
             for j, col in enumerate(columns): self.review_table.setItem(i, j, QTableWidgetItem(str(row.get(col, ""))))
-        self.review_table.resizeColumnsToContents()
+        if len(frame) <= 80:
+            self.review_table.resizeColumnsToContents()
 
     @Slot(str)
     def on_failed(self, message: str) -> None:
